@@ -269,8 +269,8 @@ function App() {
         ))}
       </ul>
       <p className="hint">
-        Start/stop works now; upstream stdio and remote MCP transports are still
-        placeholders, so aggregated tools stay empty until those land.
+        Local stdio, remote Streamable HTTP, and legacy SSE servers start from
+        this list. Env values and bearer tokens stay in the keychain.
       </p>
 
       <h2>Client tokens</h2>

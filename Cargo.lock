@@ -2236,10 +2236,10 @@ dependencies = [
 name = "mcp-manager"
 version = "0.1.0"
 dependencies = [
- "async-trait",
  "mcp-core",
  "mcp-http",
  "mcp-platform",
+ "mcp-runtime",
  "serde",
  "serde_json",
  "tauri",
@@ -2263,7 +2263,6 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
- "http",
  "mcp-core",
  "reqwest 0.12.28",
  "serde_json",

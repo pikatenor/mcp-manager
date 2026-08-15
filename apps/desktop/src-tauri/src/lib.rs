@@ -2,16 +2,14 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use async_trait::async_trait;
 use mcp_core::{
-    AggregatorError, BackendConnector, IssuedToken, McpBackend, RegistryError, ServerConfig,
-    ServerRegistry, ServerState, ServerType, TokenRecord, TokenService, Tool,
+    IssuedToken, ServerConfig, ServerRegistry, ServerState, ServerType, TokenRecord, TokenService,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, KeychainSecretStore, SecretStore, SecretStoreError,
 };
+use mcp_runtime::McpConnector;
 use serde::Deserialize;
-use serde_json::Value;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State};
@@ -20,32 +18,6 @@ use tokio::sync::Mutex as AsyncMutex;
 struct AppTokens(Arc<Mutex<TokenService>>);
 struct AppRegistry(Arc<AsyncMutex<ServerRegistry>>);
 struct AppSecrets(Arc<dyn SecretStore>);
-
-struct EmptyBackend;
-
-#[async_trait]
-impl McpBackend for EmptyBackend {
-    async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
-        Ok(Vec::new())
-    }
-
-    async fn call_tool(&self, name: &str, _arguments: Value) -> Result<Value, AggregatorError> {
-        Err(AggregatorError::UnknownTool(name.to_string()))
-    }
-}
-
-struct PlaceholderConnector;
-
-#[async_trait]
-impl BackendConnector for PlaceholderConnector {
-    async fn connect(
-        &self,
-        _config: &ServerConfig,
-        _secrets: &HashMap<String, String>,
-    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
-        Ok(Arc::new(EmptyBackend))
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct AddServerRequest {
@@ -255,7 +227,7 @@ pub fn run() {
             let tokens = Arc::new(Mutex::new(tokens));
             let registry = ServerRegistry::open_sqlite(
                 &data_dir.join("state.db"),
-                Arc::new(PlaceholderConnector),
+                Arc::new(McpConnector),
             )?;
             let aggregator = registry.aggregator();
             let registry = Arc::new(AsyncMutex::new(registry));
