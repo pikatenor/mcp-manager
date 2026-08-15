@@ -1,0 +1,9 @@
+[package]
+name = "mcp-platform"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OS adapters (secrets, paths, browser) behind traits"
+
+[dependencies]
+thiserror.workspace = true

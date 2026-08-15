@@ -1,0 +1,8 @@
+{
+  "name": "mcp-manager",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter mcp-manager dev",
+    "tauri": "pnpm --filter mcp-manager tauri"
+  }
+}

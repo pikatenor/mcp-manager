@@ -1,0 +1,24 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node
+node_modules/
+dist/
+.vite/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+
+# Env / secrets
+.env
+.env.*
+
+# Tauri generated
+apps/desktop/src-tauri/gen/
+apps/desktop/src-tauri/target/
+
+# Local reference clone of mcp-router (not part of this repo)
+__reference/

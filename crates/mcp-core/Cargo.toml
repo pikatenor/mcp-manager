@@ -1,0 +1,11 @@
+[package]
+name = "mcp-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OS-free MCP aggregator core: models, routing, tokens, tool filters"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true

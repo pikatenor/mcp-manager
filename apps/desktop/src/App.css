@@ -1,0 +1,20 @@
+.container {
+  margin: 0;
+  padding: 2rem;
+  font-family:
+    ui-sans-serif,
+    system-ui,
+    sans-serif;
+}
+
+code {
+  display: inline-block;
+  margin: 0.5rem 0 1rem;
+  padding: 0.4rem 0.6rem;
+  background: #f4f4f5;
+  border-radius: 4px;
+}
+
+.hint {
+  color: #666;
+}

@@ -1,0 +1,10 @@
+[package]
+name = "mcp-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Localhost Streamable HTTP front for the MCP aggregator"
+
+[dependencies]
+mcp-core.workspace = true
+thiserror.workspace = true
