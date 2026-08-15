@@ -1,6 +1,9 @@
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 
-use super::token::{TokenError, TokenService};
+use rusqlite::Connection;
+
+use super::token::{TokenError, TokenRecord, TokenService};
 
 #[derive(Debug, thiserror::Error)]
 pub enum StoreError {
@@ -13,7 +16,46 @@ pub enum StoreError {
 impl TokenService {
     /// Open (or create) a SQLite file and load token records. Secrets stay hashed.
     pub fn open_sqlite(path: &Path) -> Result<Self, StoreError> {
-        unimplemented!("TokenService::open_sqlite")
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| StoreError::Database(e.to_string()))?;
+        }
+        let conn = Connection::open(path).map_err(|e| StoreError::Database(e.to_string()))?;
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS tokens (
+                id TEXT PRIMARY KEY,
+                client_name TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                issued_at INTEGER NOT NULL,
+                revoked_at INTEGER
+            )",
+            [],
+        )
+        .map_err(|e| StoreError::Database(e.to_string()))?;
+
+        let records = {
+            let mut stmt = conn
+                .prepare("SELECT id, client_name, token_hash, issued_at, revoked_at FROM tokens")
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            let mapped = stmt
+                .query_map([], |row| {
+                    Ok(TokenRecord {
+                        id: row.get(0)?,
+                        client_name: row.get(1)?,
+                        token_hash: row.get(2)?,
+                        issued_at: row.get(3)?,
+                        revoked_at: row.get(4)?,
+                    })
+                })
+                .map_err(|e| StoreError::Database(e.to_string()))?;
+            mapped
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| StoreError::Database(e.to_string()))?
+        };
+
+        Ok(TokenService {
+            records,
+            db: Some(Arc::new(Mutex::new(conn))),
+        })
     }
 }
 

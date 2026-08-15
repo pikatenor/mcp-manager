@@ -1,4 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use rand::RngCore;
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -31,7 +34,8 @@ pub enum TokenError {
 
 #[derive(Default)]
 pub struct TokenService {
-    records: Vec<TokenRecord>,
+    pub(crate) records: Vec<TokenRecord>,
+    pub(crate) db: Option<Arc<Mutex<Connection>>>,
 }
 
 fn now_unix() -> i64 {
@@ -63,6 +67,10 @@ impl TokenService {
             issued_at,
             revoked_at: None,
         });
+        if let Some(db) = &self.db {
+            let record = self.records.last().expect("just pushed");
+            persist_insert(db, record);
+        }
         IssuedToken {
             id,
             client_name: client_name.to_string(),
@@ -91,6 +99,9 @@ impl TokenService {
             .find(|r| r.id == id)
             .ok_or(TokenError::UnknownId)?;
         record.revoked_at = Some(now_unix());
+        if let Some(db) = &self.db {
+            persist_revoke(db, record);
+        }
         Ok(())
     }
 
@@ -101,6 +112,31 @@ impl TokenService {
 
 pub fn hash_token(plaintext: &str) -> String {
     hex::encode(Sha256::digest(plaintext.as_bytes()))
+}
+
+fn persist_insert(db: &Arc<Mutex<Connection>>, record: &TokenRecord) {
+    if let Ok(conn) = db.lock() {
+        let _ = conn.execute(
+            "INSERT INTO tokens (id, client_name, token_hash, issued_at, revoked_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                record.id,
+                record.client_name,
+                record.token_hash,
+                record.issued_at,
+                record.revoked_at,
+            ],
+        );
+    }
+}
+
+fn persist_revoke(db: &Arc<Mutex<Connection>>, record: &TokenRecord) {
+    if let Ok(conn) = db.lock() {
+        let _ = conn.execute(
+            "UPDATE tokens SET revoked_at = ?1 WHERE id = ?2",
+            rusqlite::params![record.revoked_at, record.id],
+        );
+    }
 }
 
 #[cfg(test)]
