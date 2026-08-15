@@ -28,6 +28,10 @@ rand = "0.9"
 url = "2"
 keyring = "3"
 dirs = "6"
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+http = "1"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = "2"
 tauri-plugin-opener = "2"
