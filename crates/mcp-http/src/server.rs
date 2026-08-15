@@ -1,13 +1,14 @@
 use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Json, State};
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use mcp_core::{Aggregator, TokenService};
+use mcp_core::{Aggregator, AggregatorError, TokenService};
+use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::extract_bearer;
@@ -15,7 +16,6 @@ use crate::auth::extract_bearer;
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<Mutex<TokenService>>,
-    #[allow(dead_code)]
     pub aggregator: Arc<AsyncMutex<Aggregator>>,
 }
 
@@ -32,7 +32,7 @@ pub fn router_with_aggregator(
         aggregator,
     };
     Router::new()
-        .route("/mcp", post(mcp_placeholder))
+        .route("/mcp", post(mcp_handler))
         .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -77,11 +77,101 @@ async fn require_token(State(state): State<AppState>, req: Request<Body>, next: 
     next.run(req).await
 }
 
-async fn mcp_placeholder() -> impl IntoResponse {
+fn jsonrpc_ok(id: Value, result: Value) -> Response {
     (
         StatusCode::OK,
-        axum::Json(serde_json::json!({ "ok": true })),
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "result": result
+        })),
     )
+        .into_response()
+}
+
+fn jsonrpc_err(id: Value, code: i64, message: String) -> Response {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": code, "message": message }
+        })),
+    )
+        .into_response()
+}
+
+async fn mcp_handler(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let id = body.get("id").cloned().unwrap_or(Value::Null);
+    let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+    let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
+
+    match method {
+        "initialize" => jsonrpc_ok(
+            id,
+            json!({
+                "protocolVersion": "2025-03-26",
+                "capabilities": { "tools": {} },
+                "serverInfo": {
+                    "name": "mcp-manager",
+                    "version": env!("CARGO_PKG_VERSION")
+                }
+            }),
+        ),
+        "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
+        "ping" => jsonrpc_ok(id, json!({})),
+        "tools/list" => {
+            let aggregator = state.aggregator.lock().await;
+            match aggregator.list_tools().await {
+                Ok(tools) => {
+                    let tools: Vec<Value> = tools
+                        .into_iter()
+                        .map(|tool| {
+                            json!({
+                                "name": tool.name,
+                                "description": tool.description.unwrap_or_default(),
+                                "inputSchema": { "type": "object", "properties": {} }
+                            })
+                        })
+                        .collect();
+                    jsonrpc_ok(id, json!({ "tools": tools }))
+                }
+                Err(err) => jsonrpc_err(id, -32603, err.to_string()),
+            }
+        }
+        "tools/call" => {
+            let name = params
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let arguments = params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+            let aggregator = state.aggregator.lock().await;
+            match aggregator.call_tool(name, arguments).await {
+                Ok(value) => jsonrpc_ok(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": value.to_string() }],
+                        "isError": false
+                    }),
+                ),
+                Err(AggregatorError::UnknownTool(name) | AggregatorError::PrivateTool(name)) => {
+                    jsonrpc_err(id, -32601, name)
+                }
+                Err(err) => jsonrpc_ok(
+                    id,
+                    json!({
+                        "content": [{ "type": "text", "text": err.to_string() }],
+                        "isError": true
+                    }),
+                ),
+            }
+        }
+        "" => jsonrpc_err(id, -32600, "invalid request".into()),
+        other => jsonrpc_err(id, -32601, format!("method not found: {other}")),
+    }
 }
 
 #[cfg(test)]
