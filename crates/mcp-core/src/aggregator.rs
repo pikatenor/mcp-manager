@@ -70,6 +70,19 @@ impl Aggregator {
         }
     }
 
+    pub fn set_tool_permissions(&mut self, id: &str, tool_permissions: HashMap<String, bool>) {
+        if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
+            server.tool_permissions = tool_permissions;
+        }
+    }
+
+    pub async fn origin_tools(&self, id: &str) -> Result<Vec<Tool>, AggregatorError> {
+        let Some(server) = self.servers.iter().find(|s| s.id == id && s.running) else {
+            return Ok(Vec::new());
+        };
+        server.backend.list_tools().await
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
         let mut tools = Vec::new();
         for server in &self.servers {

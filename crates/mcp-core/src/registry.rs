@@ -93,7 +93,11 @@ impl ServerRegistry {
 
     pub fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
-        Ok(self.store.update(config)?)
+        let updated = self.store.update(config)?;
+        if let Ok(mut aggregator) = self.aggregator.try_lock() {
+            aggregator.set_tool_permissions(&updated.id, updated.tool_permissions.clone());
+        }
+        Ok(updated)
     }
 
     pub async fn delete(&mut self, id: &str) -> Result<bool, RegistryError> {
