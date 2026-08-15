@@ -1,3 +1,5 @@
+use std::net::IpAddr;
+
 use url::Url;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -12,7 +14,43 @@ pub enum RemoteUrlError {
 
 /// Allow https anywhere, and http only to localhost. Reject metadata/link-local hosts.
 pub fn validate_remote_url(raw: &str) -> Result<Url, RemoteUrlError> {
-    unimplemented!("validate_remote_url")
+    let url = Url::parse(raw).map_err(|e| RemoteUrlError::Invalid(e.to_string()))?;
+    let host = url
+        .host_str()
+        .ok_or_else(|| RemoteUrlError::Invalid("missing host".into()))?;
+
+    if is_refused_host(host) {
+        return Err(RemoteUrlError::RefusedHost(host.to_string()));
+    }
+
+    match url.scheme() {
+        "https" => Ok(url),
+        "http" if is_loopback_host(host) => Ok(url),
+        "http" => Err(RemoteUrlError::Scheme),
+        _ => Err(RemoteUrlError::Scheme),
+    }
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "localhost" {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .map(|ip| ip.is_loopback())
+        .unwrap_or(false)
+}
+
+fn is_refused_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    if host == "metadata.google.internal" {
+        return true;
+    }
+    match host.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => ip.is_link_local(),
+        Ok(IpAddr::V6(ip)) => ip.is_unicast_link_local(),
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]
