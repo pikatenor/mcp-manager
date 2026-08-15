@@ -2167,6 +2167,7 @@ dependencies = [
 name = "mcp-http"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "axum",
  "http",
  "http-body-util",
@@ -2182,6 +2183,7 @@ dependencies = [
 name = "mcp-manager"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "mcp-core",
  "mcp-http",
  "mcp-platform",
@@ -2190,6 +2192,7 @@ dependencies = [
  "tauri",
  "tauri-build",
  "tauri-plugin-opener",
+ "tokio",
 ]
 
 [[package]]
