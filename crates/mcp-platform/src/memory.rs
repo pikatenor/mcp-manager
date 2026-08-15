@@ -17,15 +17,28 @@ impl MemorySecretStore {
 
 impl SecretStore for MemorySecretStore {
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
-        unimplemented!("MemorySecretStore::set")
+        self.inner
+            .lock()
+            .map_err(|e| SecretStoreError::Operation(e.to_string()))?
+            .insert(key.to_string(), value.to_string());
+        Ok(())
     }
 
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
-        unimplemented!("MemorySecretStore::get")
+        Ok(self
+            .inner
+            .lock()
+            .map_err(|e| SecretStoreError::Operation(e.to_string()))?
+            .get(key)
+            .cloned())
     }
 
     fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
-        unimplemented!("MemorySecretStore::delete")
+        self.inner
+            .lock()
+            .map_err(|e| SecretStoreError::Operation(e.to_string()))?
+            .remove(key);
+        Ok(())
     }
 }
 

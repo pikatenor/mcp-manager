@@ -7,3 +7,5 @@ description = "OS adapters (secrets, paths, browser) behind traits"
 
 [dependencies]
 thiserror.workspace = true
+dirs.workspace = true
+keyring.workspace = true
