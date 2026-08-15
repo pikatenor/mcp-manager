@@ -1,4 +1,6 @@
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedToken {
@@ -29,7 +31,20 @@ pub enum TokenError {
 
 #[derive(Default)]
 pub struct TokenService {
-    _private: (),
+    records: Vec<TokenRecord>,
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn random_hex(nbytes: usize) -> String {
+    let mut bytes = vec![0u8; nbytes];
+    rand::rng().fill_bytes(&mut bytes);
+    hex::encode(bytes)
 }
 
 impl TokenService {
@@ -38,24 +53,54 @@ impl TokenService {
     }
 
     pub fn issue(&mut self, client_name: &str) -> IssuedToken {
-        unimplemented!("TokenService::issue")
+        let id = random_hex(16);
+        let plaintext = format!("mcpm_{}", random_hex(24));
+        let issued_at = now_unix();
+        self.records.push(TokenRecord {
+            id: id.clone(),
+            client_name: client_name.to_string(),
+            token_hash: hash_token(&plaintext),
+            issued_at,
+            revoked_at: None,
+        });
+        IssuedToken {
+            id,
+            client_name: client_name.to_string(),
+            plaintext,
+            issued_at,
+        }
     }
 
     pub fn validate(&self, plaintext: &str) -> Result<TokenRecord, TokenError> {
-        unimplemented!("TokenService::validate")
+        let hash = hash_token(plaintext);
+        let record = self
+            .records
+            .iter()
+            .find(|r| r.token_hash == hash)
+            .ok_or(TokenError::Invalid)?;
+        if record.revoked_at.is_some() {
+            return Err(TokenError::Revoked);
+        }
+        Ok(record.clone())
     }
 
     pub fn revoke(&mut self, id: &str) -> Result<(), TokenError> {
-        unimplemented!("TokenService::revoke")
+        let record = self
+            .records
+            .iter_mut()
+            .find(|r| r.id == id)
+            .ok_or(TokenError::UnknownId)?;
+        record.revoked_at = Some(now_unix());
+        Ok(())
     }
 
     pub fn list(&self) -> Vec<TokenRecord> {
-        unimplemented!("TokenService::list")
+        self.records.clone()
     }
 }
 
 pub fn hash_token(plaintext: &str) -> String {
-    unimplemented!("hash_token")
+    hex::encode(Sha256::digest(plaintext.as_bytes()))
 }
 
 #[cfg(test)]

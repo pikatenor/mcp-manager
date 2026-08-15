@@ -53,15 +53,48 @@ impl Aggregator {
     }
 
     pub fn add_server(&mut self, server: RegisteredServer) {
-        unimplemented!("Aggregator::add_server")
+        self.servers.push(server);
     }
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
-        unimplemented!("Aggregator::list_tools")
+        let mut tools = Vec::new();
+        for server in &self.servers {
+            if !server.running {
+                continue;
+            }
+            for tool in server.backend.list_tools().await? {
+                if !crate::permissions::is_tool_public(&server.tool_permissions, &tool.name) {
+                    continue;
+                }
+                tools.push(AggregatedTool {
+                    name: crate::naming::prefix_tool_name(&server.name, &tool.name),
+                    description: tool.description,
+                    source_server: server.name.clone(),
+                });
+            }
+        }
+        Ok(tools)
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AggregatorError> {
-        unimplemented!("Aggregator::call_tool")
+        let Some((server_name, tool_name)) = crate::naming::strip_server_prefix(name) else {
+            return Err(AggregatorError::UnknownTool(name.to_string()));
+        };
+        let Some(server) = self
+            .servers
+            .iter()
+            .find(|s| s.running && s.name == server_name)
+        else {
+            return Err(AggregatorError::UnknownTool(name.to_string()));
+        };
+        if !crate::permissions::is_tool_public(&server.tool_permissions, tool_name) {
+            return Err(AggregatorError::PrivateTool(name.to_string()));
+        }
+        let available = server.backend.list_tools().await?;
+        if !available.iter().any(|t| t.name == tool_name) {
+            return Err(AggregatorError::UnknownTool(name.to_string()));
+        }
+        server.backend.call_tool(tool_name, arguments).await
     }
 }
 

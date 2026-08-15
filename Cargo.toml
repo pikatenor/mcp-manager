@@ -25,6 +25,7 @@ async-trait = "0.1"
 sha2 = "0.10"
 hex = "0.4"
 rand = "0.9"
+url = "2"
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-build = "2"
 tauri-plugin-opener = "2"

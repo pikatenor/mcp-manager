@@ -3,12 +3,12 @@ pub const TOOL_DELIMITER: &str = "__";
 
 /// Prefix a tool name with its source server. Server names must not contain `__`.
 pub fn prefix_tool_name(server_name: &str, tool_name: &str) -> String {
-    unimplemented!("prefix_tool_name")
+    format!("{server_name}{TOOL_DELIMITER}{tool_name}")
 }
 
 /// Split `server__tool` into `(server, tool)`. Returns `None` if the delimiter is missing.
 pub fn strip_server_prefix(prefixed: &str) -> Option<(&str, &str)> {
-    unimplemented!("strip_server_prefix")
+    prefixed.split_once(TOOL_DELIMITER)
 }
 
 #[cfg(test)]

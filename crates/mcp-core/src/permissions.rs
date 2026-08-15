@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 /// Per-server tool visibility. Missing keys are public. `false` hides and blocks the tool.
 pub fn is_tool_public(permissions: &HashMap<String, bool>, tool_name: &str) -> bool {
-    unimplemented!("is_tool_public")
+    permissions.get(tool_name).copied().unwrap_or(true)
 }
 
 #[cfg(test)]
