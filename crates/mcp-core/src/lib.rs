@@ -6,6 +6,7 @@
 pub mod aggregator;
 pub mod naming;
 pub mod permissions;
+pub mod registry;
 pub mod remote_url;
 pub mod servers;
 pub mod sse;
@@ -15,6 +16,9 @@ pub mod token;
 pub use aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend, Tool};
 pub use naming::{prefix_tool_name, strip_server_prefix, TOOL_DELIMITER};
 pub use permissions::is_tool_public;
+pub use registry::{
+    BackendConnector, RegistryError, ServerRegistry, ServerState, ServerStatus,
+};
 pub use remote_url::{validate_remote_url, RemoteUrlError};
 pub use servers::{ServerConfig, ServerStore, ServerType};
 pub use sse::{parse_sse_endpoint_event, SseClientTransport, SseTransportError};
