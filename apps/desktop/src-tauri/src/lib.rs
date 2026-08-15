@@ -7,9 +7,10 @@ use mcp_core::{
     TokenRecord, TokenService,
 };
 use mcp_platform::{
-    server_bearer_key, server_env_key, KeychainSecretStore, SecretStore, SecretStoreError,
+    server_bearer_key, server_env_key, server_oauth_key, KeychainSecretStore, NativeBrowserOpener,
+    SecretStore, SecretStoreError,
 };
-use mcp_runtime::McpConnector;
+use mcp_runtime::{McpConnector, OAuthFlow, ReqwestOAuthHttp};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -79,6 +80,9 @@ fn delete_secrets(store: &dyn SecretStore, config: &ServerConfig) {
         let _ = store.delete(&server_env_key(&config.id, key));
     }
     let _ = store.delete(&server_bearer_key(&config.id));
+    let _ = store.delete(&server_oauth_key(&config.id, "access_token"));
+    let _ = store.delete(&server_oauth_key(&config.id, "refresh_token"));
+    let _ = store.delete(&server_oauth_key(&config.id, "client_id"));
 }
 
 #[tauri::command]
@@ -261,6 +265,48 @@ async fn set_tool_permission(
     Ok(())
 }
 
+#[tauri::command]
+async fn oauth_connect(
+    registry: State<'_, AppRegistry>,
+    secrets: State<'_, AppSecrets>,
+    id: String,
+) -> Result<(), String> {
+    let remote_url = {
+        let registry = registry.0.lock().await;
+        let state = registry
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .ok_or_else(|| format!("unknown server: {id}"))?;
+        if state.config.server_type == ServerType::Local {
+            return Err("OAuth is only for remote servers".into());
+        }
+        state
+            .config
+            .remote_url
+            .ok_or_else(|| "remote_url is required".to_string())?
+    };
+    let flow = OAuthFlow::new(
+        Arc::new(ReqwestOAuthHttp::new().map_err(|e| e.to_string())?),
+        Arc::new(NativeBrowserOpener),
+        secrets.0.clone(),
+    );
+    flow.authorize(&id, &remote_url)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+fn oauth_connected(secrets: State<AppSecrets>, id: String) -> Result<bool, String> {
+    Ok(secrets
+        .0
+        .get(&server_oauth_key(&id, "access_token"))
+        .map_err(|e| e.to_string())?
+        .filter(|value| !value.is_empty())
+        .is_some())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -276,7 +322,9 @@ pub fn run() {
             start_server,
             stop_server,
             list_server_tools,
-            set_tool_permission
+            set_tool_permission,
+            oauth_connect,
+            oauth_connected
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;
@@ -345,7 +393,16 @@ pub fn run() {
                     "quit" => {
                         app.exit(0);
                     }
-                    "copy-endpoint" => {}
+                    "copy-endpoint" => {
+                        let endpoint = format!(
+                            "http://{}{}",
+                            mcp_core::DEFAULT_HTTP_BIND,
+                            mcp_core::DEFAULT_MCP_PATH
+                        );
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(endpoint);
+                        }
+                    }
                     _ => {}
                 })
                 .build(app)?;

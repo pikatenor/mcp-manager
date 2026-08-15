@@ -63,6 +63,9 @@ function App() {
   const [toolsByServer, setToolsByServer] = useState<Record<string, ServerTool[]>>(
     {},
   );
+  const [oauthByServer, setOauthByServer] = useState<Record<string, boolean>>(
+    {},
+  );
   const [serverName, setServerName] = useState("");
   const [serverType, setServerType] = useState<ServerType>("local");
   const [command, setCommand] = useState("npx");
@@ -93,6 +96,17 @@ function App() {
         }),
     );
     setToolsByServer(next);
+    const oauth: Record<string, boolean> = {};
+    await Promise.all(
+      listed
+        .filter((server) => server.config.server_type !== "local")
+        .map(async (server) => {
+          oauth[server.config.id] = await invoke<boolean>("oauth_connected", {
+            id: server.config.id,
+          });
+        }),
+    );
+    setOauthByServer(oauth);
   }
 
   useEffect(() => {
@@ -199,6 +213,16 @@ function App() {
     }
   }
 
+  async function onOauth(id: string) {
+    setError(null);
+    try {
+      await invoke("oauth_connect", { id });
+      await refreshServers();
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
   async function copyEndpoint() {
     await navigator.clipboard.writeText(endpoint);
   }
@@ -298,6 +322,11 @@ function App() {
               <button type="button" onClick={() => onDelete(server.config.id)}>
                 Delete
               </button>
+              {server.config.server_type !== "local" && (
+                <button type="button" onClick={() => onOauth(server.config.id)}>
+                  {oauthByServer[server.config.id] ? "Re-auth" : "OAuth"}
+                </button>
+              )}
             </div>
             {server.status === "running" && (
               <ul>

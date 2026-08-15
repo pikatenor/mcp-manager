@@ -22,4 +22,5 @@ serde_json.workspace = true
 tauri.workspace = true
 tauri-plugin-opener.workspace = true
 tokio.workspace = true
+arboard.workspace = true
 
