@@ -447,4 +447,37 @@ mod tests {
         assert!(registry.list().unwrap().is_empty());
         assert!(registry.list_tools().await.unwrap().is_empty());
     }
+
+    #[tokio::test]
+    async fn update_permissions_hides_running_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry = ServerRegistry::open_sqlite(
+            &path,
+            RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]),
+        )
+        .unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        registry.start("srv-1", HashMap::new()).await.unwrap();
+        let names: Vec<_> = registry
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["everything__echo", "everything__delete"]);
+
+        let mut config = registry.list().unwrap()[0].config.clone();
+        config.tool_permissions.insert("delete".into(), false);
+        registry.update(config).unwrap();
+        let names: Vec<_> = registry
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["everything__echo"]);
+    }
 }
