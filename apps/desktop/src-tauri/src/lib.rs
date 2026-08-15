@@ -3,13 +3,14 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_core::{
-    IssuedToken, ServerConfig, ServerRegistry, ServerState, ServerType, TokenRecord, TokenService,
+    is_tool_public, IssuedToken, ServerConfig, ServerRegistry, ServerState, ServerType,
+    TokenRecord, TokenService,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, KeychainSecretStore, SecretStore, SecretStoreError,
 };
 use mcp_runtime::McpConnector;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
 use tauri::{Manager, State};
@@ -18,6 +19,12 @@ use tokio::sync::Mutex as AsyncMutex;
 struct AppTokens(Arc<Mutex<TokenService>>);
 struct AppRegistry(Arc<AsyncMutex<ServerRegistry>>);
 struct AppSecrets(Arc<dyn SecretStore>);
+
+#[derive(Debug, Serialize)]
+struct ServerToolView {
+    name: String,
+    public: bool,
+}
 
 #[derive(Debug, Deserialize)]
 struct AddServerRequest {
@@ -205,6 +212,55 @@ async fn stop_server(registry: State<'_, AppRegistry>, id: String) -> Result<(),
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn list_server_tools(
+    registry: State<'_, AppRegistry>,
+    id: String,
+) -> Result<Vec<ServerToolView>, String> {
+    let registry = registry.0.lock().await;
+    let config = registry
+        .list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|state| state.config.id == id)
+        .ok_or_else(|| format!("unknown server: {id}"))?
+        .config;
+    let tools = registry
+        .aggregator()
+        .lock()
+        .await
+        .origin_tools(&id)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(tools
+        .into_iter()
+        .map(|tool| ServerToolView {
+            public: is_tool_public(&config.tool_permissions, &tool.name),
+            name: tool.name,
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn set_tool_permission(
+    registry: State<'_, AppRegistry>,
+    id: String,
+    tool_name: String,
+    public: bool,
+) -> Result<(), String> {
+    let mut registry = registry.0.lock().await;
+    let mut config = registry
+        .list()
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .find(|state| state.config.id == id)
+        .ok_or_else(|| format!("unknown server: {id}"))?
+        .config;
+    config.tool_permissions.insert(tool_name, public);
+    registry.update(config).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -218,7 +274,9 @@ pub fn run() {
             add_server,
             delete_server,
             start_server,
-            stop_server
+            stop_server,
+            list_server_tools,
+            set_tool_permission
         ])
         .setup(|app| {
             let data_dir = app.path().app_data_dir()?;

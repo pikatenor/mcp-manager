@@ -37,6 +37,11 @@ type ServerState = {
   last_error: string | null;
 };
 
+type ServerTool = {
+  name: string;
+  public: boolean;
+};
+
 function parseEnv(raw: string): Record<string, string> {
   const env: Record<string, string> = {};
   for (const line of raw.split("\n")) {
@@ -55,6 +60,9 @@ function App() {
   const [tokens, setTokens] = useState<TokenRecord[]>([]);
   const [plaintext, setPlaintext] = useState<string | null>(null);
   const [servers, setServers] = useState<ServerState[]>([]);
+  const [toolsByServer, setToolsByServer] = useState<Record<string, ServerTool[]>>(
+    {},
+  );
   const [serverName, setServerName] = useState("");
   const [serverType, setServerType] = useState<ServerType>("local");
   const [command, setCommand] = useState("npx");
@@ -73,6 +81,18 @@ function App() {
   async function refreshServers() {
     const listed = await invoke<ServerState[]>("list_servers");
     setServers(listed);
+    const next: Record<string, ServerTool[]> = {};
+    await Promise.all(
+      listed
+        .filter((server) => server.status === "running")
+        .map(async (server) => {
+          next[server.config.id] = await invoke<ServerTool[]>(
+            "list_server_tools",
+            { id: server.config.id },
+          );
+        }),
+    );
+    setToolsByServer(next);
   }
 
   useEffect(() => {
@@ -159,6 +179,20 @@ function App() {
     setError(null);
     try {
       await invoke("delete_server", { id });
+      await refreshServers();
+    } catch (err) {
+      setError(String(err));
+    }
+  }
+
+  async function onToggleTool(id: string, toolName: string, isPublic: boolean) {
+    setError(null);
+    try {
+      await invoke("set_tool_permission", {
+        id,
+        toolName,
+        public: isPublic,
+      });
       await refreshServers();
     } catch (err) {
       setError(String(err));
@@ -265,6 +299,28 @@ function App() {
                 Delete
               </button>
             </div>
+            {server.status === "running" && (
+              <ul>
+                {(toolsByServer[server.config.id] ?? []).map((tool) => (
+                  <li key={tool.name}>
+                    <label className="hint">
+                      <input
+                        type="checkbox"
+                        checked={tool.public}
+                        onChange={(e) =>
+                          onToggleTool(
+                            server.config.id,
+                            tool.name,
+                            e.currentTarget.checked,
+                          )
+                        }
+                      />{" "}
+                      {tool.name} {tool.public ? "public" : "hidden"}
+                    </label>
+                  </li>
+                ))}
+              </ul>
+            )}
           </li>
         ))}
       </ul>
