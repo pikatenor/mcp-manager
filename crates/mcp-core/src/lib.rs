@@ -3,8 +3,17 @@
 //! This crate must not contain `#[cfg(target_os = ...)]`. Platform I/O belongs
 //! in `mcp-platform`.
 
-/// Delimiter used when prefixing aggregated tool names: `{server}__{tool}`.
-pub const TOOL_DELIMITER: &str = "__";
+pub mod aggregator;
+pub mod naming;
+pub mod permissions;
+pub mod sse;
+pub mod token;
+
+pub use aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend, Tool};
+pub use naming::{prefix_tool_name, strip_server_prefix, TOOL_DELIMITER};
+pub use permissions::is_tool_public;
+pub use sse::{parse_sse_endpoint_event, SseClientTransport, SseTransportError};
+pub use token::{IssuedToken, TokenError, TokenRecord, TokenService};
 
 /// Default bind address for the aggregator HTTP endpoint.
 pub const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8757";
