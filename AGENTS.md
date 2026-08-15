@@ -52,7 +52,7 @@ cargo test -p mcp-core --lib
 cargo test -p mcp-http
 cargo test -p mcp-runtime
 cargo clippy --all-targets -- -D warnings
-pnpm --filter mcp-manager exec tsc --noEmit
+pnpm -C apps/desktop exec tsc --noEmit
 pnpm tauri dev
 ```
 
