@@ -2172,6 +2172,7 @@ dependencies = [
  "http-body-util",
  "mcp-core",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tower",
