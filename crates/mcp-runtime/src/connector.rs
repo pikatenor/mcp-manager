@@ -28,7 +28,8 @@ enum Session {
         next_id: i64,
     },
     Stdio {
-        _child: Child,
+        // Boxed: `Child` is large on Linux and would dominate the enum size.
+        _child: Box<Child>,
         stdin: ChildStdin,
         stdout: BufReader<ChildStdout>,
         next_id: i64,
@@ -274,7 +275,7 @@ async fn connect_stdio(
         .take()
         .ok_or_else(|| RegistryError::Backend("missing stdout".into()))?;
     let mut session = Session::Stdio {
-        _child: child,
+        _child: Box::new(child),
         stdin,
         stdout: BufReader::new(stdout),
         next_id: 0,
