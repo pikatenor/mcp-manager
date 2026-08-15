@@ -4,4 +4,4 @@ mod connector;
 mod oauth;
 
 pub use connector::McpConnector;
-pub use oauth::{OAuthError, OAuthFlow, OAuthHttp};
+pub use oauth::{OAuthError, OAuthFlow, OAuthHttp, ReqwestOAuthHttp};

@@ -49,7 +49,7 @@ impl OAuthHttp for FakeHttp {
         if url.ends_with("/token") {
             assert_eq!(form.get("grant_type").map(String::as_str), Some("authorization_code"));
             assert_eq!(form.get("code").map(String::as_str), Some("auth-code"));
-            assert!(form.get("code_verifier").is_some());
+            assert!(form.contains_key("code_verifier"));
             return Ok(json!({
                 "access_token": self.access_token,
                 "refresh_token": self.refresh_token,
@@ -126,15 +126,15 @@ async fn authorize_pkce_loopback_stores_tokens() {
     let pairs: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
     assert_eq!(pairs.get("client_id").map(String::as_str), Some("cid-1"));
     assert_eq!(pairs.get("code_challenge_method").map(String::as_str), Some("S256"));
-    assert!(pairs.get("code_challenge").is_some());
+    assert!(pairs.contains_key("code_challenge"));
     let state = pairs.get("state").cloned().unwrap();
     let redirect = pairs.get("redirect_uri").cloned().unwrap();
     assert!(redirect.starts_with("http://127.0.0.1:"));
     assert!(redirect.contains("/oauth/callback"));
 
-    let register = &http.posts.lock().unwrap()[0];
-    assert!(register.0.ends_with("/register"));
-    let redirect_uris = register.1["redirect_uris"].as_array().unwrap();
+    let (register_url, register_body) = http.posts.lock().unwrap()[0].clone();
+    assert!(register_url.ends_with("/register"));
+    let redirect_uris = register_body["redirect_uris"].as_array().unwrap();
     assert_eq!(redirect_uris[0].as_str(), Some(redirect.as_str()));
 
     let callback = format!("{redirect}?code=auth-code&state={state}");
