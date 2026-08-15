@@ -9,6 +9,7 @@ use super::aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend,
 use super::remote_url::validate_remote_url;
 use super::servers::{ServerConfig, ServerStore, ServerType};
 use super::store::StoreError;
+use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -53,7 +54,7 @@ pub trait BackendConnector: Send + Sync {
 pub struct ServerRegistry {
     store: ServerStore,
     connector: Arc<dyn BackendConnector>,
-    aggregator: Aggregator,
+    aggregator: Arc<AsyncMutex<Aggregator>>,
     statuses: HashMap<String, ServerStatus>,
     errors: HashMap<String, String>,
 }
@@ -79,7 +80,7 @@ impl ServerRegistry {
         Ok(Self {
             store: ServerStore::open_sqlite(path)?,
             connector,
-            aggregator: Aggregator::new(),
+            aggregator: Arc::new(AsyncMutex::new(Aggregator::new())),
             statuses: HashMap::new(),
             errors: HashMap::new(),
         })
@@ -88,6 +89,23 @@ impl ServerRegistry {
     pub fn add(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
         Ok(self.store.add(config)?)
+    }
+
+    pub fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
+        validate_config(&config)?;
+        Ok(self.store.update(config)?)
+    }
+
+    pub async fn delete(&mut self, id: &str) -> Result<bool, RegistryError> {
+        if self.store.get(id)?.is_none() {
+            return Ok(false);
+        }
+        let _ = self.stop(id).await;
+        Ok(self.store.delete(id)?)
+    }
+
+    pub fn aggregator(&self) -> Arc<AsyncMutex<Aggregator>> {
+        self.aggregator.clone()
     }
 
     pub fn list(&self) -> Result<Vec<ServerState>, RegistryError> {
@@ -130,7 +148,7 @@ impl ServerRegistry {
             .insert(config.id.clone(), ServerStatus::Starting);
         match self.connector.connect(&config, &secrets).await {
             Ok(backend) => {
-                self.aggregator.upsert_server(RegisteredServer {
+                self.aggregator.lock().await.upsert_server(RegisteredServer {
                     id: config.id.clone(),
                     name: config.name.clone(),
                     running: true,
@@ -157,7 +175,7 @@ impl ServerRegistry {
             .ok_or_else(|| RegistryError::UnknownServer(id.to_string()))?;
         self.statuses
             .insert(config.id.clone(), ServerStatus::Stopping);
-        self.aggregator.set_running(&config.id, false);
+        self.aggregator.lock().await.set_running(&config.id, false);
         self.statuses
             .insert(config.id.clone(), ServerStatus::Stopped);
         self.errors.remove(&config.id);
@@ -183,7 +201,7 @@ impl ServerRegistry {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
-        self.aggregator.list_tools().await
+        self.aggregator.lock().await.list_tools().await
     }
 }
 
@@ -391,5 +409,42 @@ mod tests {
         assert_eq!(by_id.get("disabled"), Some(&ServerStatus::Stopped));
         assert_eq!(by_id.get("manual"), Some(&ServerStatus::Stopped));
         assert_eq!(connector.seen.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_aggregator_handle_lists_started_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry = ServerRegistry::open_sqlite(
+            &path,
+            RecordingConnector::with_tools(vec![tool("echo")]),
+        )
+        .unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        registry.start("srv-1", HashMap::new()).await.unwrap();
+        let tools = registry
+            .aggregator()
+            .lock()
+            .await
+            .list_tools()
+            .await
+            .unwrap();
+        assert_eq!(tools[0].name, "everything__echo");
+    }
+
+    #[tokio::test]
+    async fn delete_stops_and_removes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry = ServerRegistry::open_sqlite(
+            &path,
+            RecordingConnector::with_tools(vec![tool("echo")]),
+        )
+        .unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        registry.start("srv-1", HashMap::new()).await.unwrap();
+        assert!(registry.delete("srv-1").await.unwrap());
+        assert!(registry.list().unwrap().is_empty());
+        assert!(registry.list_tools().await.unwrap().is_empty());
     }
 }

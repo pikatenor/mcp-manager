@@ -38,15 +38,35 @@ pub fn router_with_aggregator(
 }
 
 pub async fn serve(tokens: Arc<Mutex<TokenService>>) -> std::io::Result<()> {
+    serve_with_aggregator(tokens, Arc::new(AsyncMutex::new(Aggregator::new()))).await
+}
+
+pub async fn serve_with_aggregator(
+    tokens: Arc<Mutex<TokenService>>,
+    aggregator: Arc<AsyncMutex<Aggregator>>,
+) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(mcp_core::DEFAULT_HTTP_BIND).await?;
-    serve_with_listener(listener, tokens).await
+    serve_with_listener_and_aggregator(listener, tokens, aggregator).await
 }
 
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     tokens: Arc<Mutex<TokenService>>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router(tokens)).await
+    serve_with_listener_and_aggregator(
+        listener,
+        tokens,
+        Arc::new(AsyncMutex::new(Aggregator::new())),
+    )
+    .await
+}
+
+pub async fn serve_with_listener_and_aggregator(
+    listener: tokio::net::TcpListener,
+    tokens: Arc<Mutex<TokenService>>,
+    aggregator: Arc<AsyncMutex<Aggregator>>,
+) -> std::io::Result<()> {
+    axum::serve(listener, router_with_aggregator(tokens, aggregator)).await
 }
 
 async fn require_token(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
