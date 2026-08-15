@@ -6,10 +6,12 @@
 
 mod app_paths;
 mod browser;
+mod memory;
 mod secrets;
 
 pub use app_paths::{AppPaths, AppPathsError};
 pub use browser::{BrowserError, BrowserOpener};
+pub use memory::MemorySecretStore;
 pub use secrets::{
     server_bearer_key, server_env_key, server_oauth_key, SecretStore, SecretStoreError,
 };
