@@ -17,19 +17,46 @@ pub struct AppState {
 }
 
 pub fn router(tokens: Arc<Mutex<TokenService>>) -> Router {
-    unimplemented!("router")
+    let state = AppState { tokens };
+    Router::new()
+        .route("/mcp", post(mcp_placeholder))
+        .route_layer(from_fn_with_state(state.clone(), require_token))
+        .with_state(state)
 }
 
-async fn require_token(
-    State(state): State<AppState>,
-    mut req: Request<Body>,
-    next: Next,
-) -> Response {
-    unimplemented!("require_token")
+async fn require_token(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+    let header = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok());
+    let Some(token) = extract_bearer(header) else {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({ "error": "authentication required" })),
+        )
+            .into_response();
+    };
+    let valid = state
+        .tokens
+        .lock()
+        .ok()
+        .and_then(|svc| svc.validate(&token).ok())
+        .is_some();
+    if !valid {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({ "error": "invalid token" })),
+        )
+            .into_response();
+    }
+    next.run(req).await
 }
 
 async fn mcp_placeholder() -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(serde_json::json!({ "ok": true })))
+    (
+        StatusCode::OK,
+        axum::Json(serde_json::json!({ "ok": true })),
+    )
 }
 
 #[cfg(test)]
@@ -43,21 +70,14 @@ mod tests {
         let mut tokens = TokenService::new();
         let issued = tokens.issue("cursor");
         let plaintext = issued.plaintext.clone();
-        (
-            router(Arc::new(Mutex::new(tokens))),
-            plaintext,
-        )
+        (router(Arc::new(Mutex::new(tokens))), plaintext)
     }
 
     #[tokio::test]
     async fn missing_token_is_unauthorized() {
         let (app, _) = app_with_token();
         let res = app
-            .oneshot(
-                Request::post("/mcp")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::post("/mcp").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
@@ -87,7 +107,10 @@ mod tests {
         let res = app
             .oneshot(
                 Request::post("/mcp")
-                    .header(header::AUTHORIZATION, format!("Bearer {}", issued.plaintext))
+                    .header(
+                        header::AUTHORIZATION,
+                        format!("Bearer {}", issued.plaintext),
+                    )
                     .body(Body::empty())
                     .unwrap(),
             )

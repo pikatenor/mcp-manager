@@ -1,8 +1,20 @@
-const BEARER_PREFIX: &str = "Bearer ";
-
 /// Accept `Bearer <token>` (any case) or a raw token string.
 pub fn extract_bearer(header: Option<&str>) -> Option<String> {
-    unimplemented!("extract_bearer")
+    let value = header?.trim();
+    if value.is_empty() || value.eq_ignore_ascii_case("Bearer") {
+        return None;
+    }
+    if let Some((scheme, rest)) = value.split_once(char::is_whitespace) {
+        if scheme.eq_ignore_ascii_case("Bearer") {
+            let token = rest.trim();
+            return if token.is_empty() {
+                None
+            } else {
+                Some(token.to_string())
+            };
+        }
+    }
+    Some(value.to_string())
 }
 
 #[cfg(test)]
