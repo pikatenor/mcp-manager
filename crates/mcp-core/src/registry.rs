@@ -5,8 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::aggregator::{AggregatedTool, McpBackend};
-use super::servers::ServerConfig;
+use super::aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer};
+use super::remote_url::validate_remote_url;
+use super::servers::{ServerConfig, ServerStore, ServerType};
 use super::store::StoreError;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -50,46 +51,139 @@ pub trait BackendConnector: Send + Sync {
 }
 
 pub struct ServerRegistry {
-    _private: (),
+    store: ServerStore,
+    connector: Arc<dyn BackendConnector>,
+    aggregator: Aggregator,
+    statuses: HashMap<String, ServerStatus>,
+    errors: HashMap<String, String>,
+}
+
+fn validate_config(config: &ServerConfig) -> Result<(), RegistryError> {
+    match config.server_type {
+        ServerType::Local => Ok(()),
+        ServerType::Remote | ServerType::RemoteStreamable => {
+            let url = config.remote_url.as_deref().ok_or_else(|| {
+                RegistryError::InvalidConfig("remote_url is required".into())
+            })?;
+            validate_remote_url(url)?;
+            Ok(())
+        }
+    }
 }
 
 impl ServerRegistry {
     pub fn open_sqlite(
         path: &Path,
-        _connector: Arc<dyn BackendConnector>,
+        connector: Arc<dyn BackendConnector>,
     ) -> Result<Self, RegistryError> {
-        unimplemented!("ServerRegistry::open_sqlite")
+        Ok(Self {
+            store: ServerStore::open_sqlite(path)?,
+            connector,
+            aggregator: Aggregator::new(),
+            statuses: HashMap::new(),
+            errors: HashMap::new(),
+        })
     }
 
-    pub fn add(&mut self, _config: ServerConfig) -> Result<ServerConfig, RegistryError> {
-        unimplemented!("ServerRegistry::add")
+    pub fn add(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
+        validate_config(&config)?;
+        Ok(self.store.add(config)?)
     }
 
     pub fn list(&self) -> Result<Vec<ServerState>, RegistryError> {
-        unimplemented!("ServerRegistry::list")
+        Ok(self
+            .store
+            .list()?
+            .into_iter()
+            .map(|config| {
+                let id = &config.id;
+                ServerState {
+                    status: self
+                        .statuses
+                        .get(id)
+                        .copied()
+                        .unwrap_or(ServerStatus::Stopped),
+                    last_error: self.errors.get(id).cloned(),
+                    config,
+                }
+            })
+            .collect())
     }
 
     pub async fn start(
         &mut self,
-        _id: &str,
-        _secrets: HashMap<String, String>,
+        id: &str,
+        secrets: HashMap<String, String>,
     ) -> Result<(), RegistryError> {
-        unimplemented!("ServerRegistry::start")
+        let config = self
+            .store
+            .get(id)?
+            .ok_or_else(|| RegistryError::UnknownServer(id.to_string()))?;
+        validate_config(&config)?;
+        if config.server_type == ServerType::Local && config.command.is_none() {
+            return Err(RegistryError::InvalidConfig(
+                "command is required for local servers".into(),
+            ));
+        }
+
+        self.statuses
+            .insert(config.id.clone(), ServerStatus::Starting);
+        match self.connector.connect(&config, &secrets).await {
+            Ok(backend) => {
+                self.aggregator.upsert_server(RegisteredServer {
+                    id: config.id.clone(),
+                    name: config.name.clone(),
+                    running: true,
+                    tool_permissions: config.tool_permissions.clone(),
+                    backend,
+                });
+                self.statuses
+                    .insert(config.id.clone(), ServerStatus::Running);
+                self.errors.remove(&config.id);
+                Ok(())
+            }
+            Err(err) => {
+                self.statuses.insert(config.id.clone(), ServerStatus::Error);
+                self.errors.insert(config.id.clone(), err.to_string());
+                Err(err)
+            }
+        }
     }
 
-    pub async fn stop(&mut self, _id: &str) -> Result<(), RegistryError> {
-        unimplemented!("ServerRegistry::stop")
+    pub async fn stop(&mut self, id: &str) -> Result<(), RegistryError> {
+        let config = self
+            .store
+            .get(id)?
+            .ok_or_else(|| RegistryError::UnknownServer(id.to_string()))?;
+        self.statuses
+            .insert(config.id.clone(), ServerStatus::Stopping);
+        self.aggregator.set_running(&config.id, false);
+        self.statuses
+            .insert(config.id.clone(), ServerStatus::Stopped);
+        self.errors.remove(&config.id);
+        Ok(())
     }
 
     pub async fn auto_start(
         &mut self,
-        _secrets: HashMap<String, HashMap<String, String>>,
+        mut secrets: HashMap<String, HashMap<String, String>>,
     ) -> Result<(), RegistryError> {
-        unimplemented!("ServerRegistry::auto_start")
+        let ids: Vec<String> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|config| config.auto_start && !config.disabled)
+            .map(|config| config.id)
+            .collect();
+        for id in ids {
+            let server_secrets = secrets.remove(&id).unwrap_or_default();
+            self.start(&id, server_secrets).await?;
+        }
+        Ok(())
     }
 
-    pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, super::aggregator::AggregatorError> {
-        unimplemented!("ServerRegistry::list_tools")
+    pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
+        self.aggregator.list_tools().await
     }
 }
 

@@ -56,6 +56,20 @@ impl Aggregator {
         self.servers.push(server);
     }
 
+    pub fn upsert_server(&mut self, server: RegisteredServer) {
+        if let Some(existing) = self.servers.iter_mut().find(|s| s.id == server.id) {
+            *existing = server;
+        } else {
+            self.servers.push(server);
+        }
+    }
+
+    pub fn set_running(&mut self, id: &str, running: bool) {
+        if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
+            server.running = running;
+        }
+    }
+
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
         let mut tools = Vec::new();
         for server in &self.servers {
