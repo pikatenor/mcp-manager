@@ -1,7 +1,12 @@
-# Tauri + React + Typescript
+# Desktop app
 
-This template should help get you started developing with Tauri, React and Typescript in Vite.
+Tauri 2 + React/TypeScript shell for MCP Manager.
 
-## Recommended IDE Setup
+From the **repository root**:
 
-- [VS Code](https://code.visualstudio.com/) + [Tauri](https://marketplace.visualstudio.com/items?itemName=tauri-apps.tauri-vscode) + [rust-analyzer](https://marketplace.visualstudio.com/items?itemName=rust-lang.rust-analyzer)
+```bash
+pnpm install
+pnpm tauri dev
+```
+
+See the root [README.md](../../README.md) for architecture, endpoint, and tests, and [AGENTS.md](../../AGENTS.md) for how to change this tree.
