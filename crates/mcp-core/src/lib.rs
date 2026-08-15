@@ -13,7 +13,7 @@ pub mod sse;
 pub mod store;
 pub mod token;
 
-pub use aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend, Tool};
+pub use aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer, Tool};
 pub use naming::{prefix_tool_name, strip_server_prefix, TOOL_DELIMITER};
 pub use permissions::is_tool_public;
 pub use registry::{

@@ -16,13 +16,21 @@ async fn spawn_server(tokens: Arc<Mutex<TokenService>>) -> std::net::SocketAddr 
     addr
 }
 
-async fn post_mcp(addr: std::net::SocketAddr, authorization: Option<&str>) -> (u16, String) {
+async fn post_mcp(
+    addr: std::net::SocketAddr,
+    authorization: Option<&str>,
+    body: &str,
+) -> (u16, String) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
-    let mut request = format!("POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Length: 0\r\n");
+    let mut request = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+        body.len()
+    );
     if let Some(value) = authorization {
         request.push_str(&format!("Authorization: {value}\r\n"));
     }
     request.push_str("Connection: close\r\n\r\n");
+    request.push_str(body);
     stream.write_all(request.as_bytes()).await.unwrap();
 
     let mut buf = Vec::new();
@@ -33,13 +41,15 @@ async fn post_mcp(addr: std::net::SocketAddr, authorization: Option<&str>) -> (u
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
-    let body = text
+    let resp_body = text
         .split("\r\n\r\n")
         .nth(1)
         .unwrap_or_default()
         .to_string();
-    (status, body)
+    (status, resp_body)
 }
+
+const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"e2e","version":"0"}}}"#;
 
 #[tokio::test]
 async fn e2e_http_auth_over_tcp() {
@@ -47,15 +57,16 @@ async fn e2e_http_auth_over_tcp() {
     let issued = tokens.issue("e2e");
     let addr = spawn_server(Arc::new(Mutex::new(tokens))).await;
 
-    let (missing, _) = post_mcp(addr, None).await;
+    let (missing, _) = post_mcp(addr, None, INITIALIZE).await;
     assert_eq!(missing, 401);
 
-    let (invalid, _) = post_mcp(addr, Some("Bearer mcpm_nope")).await;
+    let (invalid, _) = post_mcp(addr, Some("Bearer mcpm_nope"), INITIALIZE).await;
     assert_eq!(invalid, 401);
 
-    let (ok, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext))).await;
+    let (ok, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), INITIALIZE).await;
     assert_eq!(ok, 200);
-    assert!(body.contains("\"ok\":true"), "{body}");
+    assert!(body.contains("mcp-manager"), "{body}");
+    assert!(body.contains("jsonrpc"), "{body}");
 }
 
 #[tokio::test]
@@ -69,9 +80,9 @@ async fn e2e_sqlite_token_survives_server_restart() {
 
     let tokens = TokenService::open_sqlite(&db).unwrap();
     let addr = spawn_server(Arc::new(Mutex::new(tokens))).await;
-    let (status, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext))).await;
+    let (status, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), INITIALIZE).await;
     assert_eq!(status, 200);
-    assert!(body.contains("\"ok\":true"), "{body}");
+    assert!(body.contains("mcp-manager"), "{body}");
 }
 
 #[tokio::test]
@@ -80,6 +91,6 @@ async fn e2e_revoked_token_is_rejected_over_tcp() {
     let issued = tokens.issue("cursor");
     tokens.revoke(&issued.id).unwrap();
     let addr = spawn_server(Arc::new(Mutex::new(tokens))).await;
-    let (status, _) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext))).await;
+    let (status, _) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), INITIALIZE).await;
     assert_eq!(status, 401);
 }
