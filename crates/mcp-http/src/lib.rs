@@ -7,4 +7,4 @@ mod server;
 
 pub use auth::extract_bearer;
 pub use mcp_core::{DEFAULT_HTTP_BIND, DEFAULT_MCP_PATH};
-pub use server::{router, serve};
+pub use server::{router, serve, serve_with_listener};

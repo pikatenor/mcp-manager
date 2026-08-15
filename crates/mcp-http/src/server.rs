@@ -26,6 +26,13 @@ pub fn router(tokens: Arc<Mutex<TokenService>>) -> Router {
 
 pub async fn serve(tokens: Arc<Mutex<TokenService>>) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(mcp_core::DEFAULT_HTTP_BIND).await?;
+    serve_with_listener(listener, tokens).await
+}
+
+pub async fn serve_with_listener(
+    listener: tokio::net::TcpListener,
+    tokens: Arc<Mutex<TokenService>>,
+) -> std::io::Result<()> {
     axum::serve(listener, router(tokens)).await
 }
 
