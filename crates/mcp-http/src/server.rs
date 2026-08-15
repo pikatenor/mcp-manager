@@ -24,6 +24,11 @@ pub fn router(tokens: Arc<Mutex<TokenService>>) -> Router {
         .with_state(state)
 }
 
+pub async fn serve(tokens: Arc<Mutex<TokenService>>) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(mcp_core::DEFAULT_HTTP_BIND).await?;
+    axum::serve(listener, router(tokens)).await
+}
+
 async fn require_token(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
     let header = req
         .headers()
