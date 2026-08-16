@@ -150,8 +150,13 @@ async fn add_server(
     }
     let id = new_server_id();
     let env_keys: Vec<String> = request.env.keys().cloned().collect();
-    persist_secrets(secrets.0.as_ref(), &id, &request.env, request.bearer.as_deref())
-        .map_err(|e| e.to_string())?;
+    persist_secrets(
+        secrets.0.as_ref(),
+        &id,
+        &request.env,
+        request.bearer.as_deref(),
+    )
+    .map_err(|e| e.to_string())?;
     let config = ServerConfig {
         id,
         name: name.to_string(),
@@ -341,10 +346,8 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let tokens = TokenService::open_sqlite(&data_dir.join("tokens.db"))?;
             let tokens = Arc::new(Mutex::new(tokens));
-            let registry = ServerRegistry::open_sqlite(
-                &data_dir.join("state.db"),
-                Arc::new(McpConnector),
-            )?;
+            let registry =
+                ServerRegistry::open_sqlite(&data_dir.join("state.db"), Arc::new(McpConnector))?;
             let aggregator = registry.aggregator();
             let registry = Arc::new(AsyncMutex::new(registry));
             #[cfg(target_os = "macos")]

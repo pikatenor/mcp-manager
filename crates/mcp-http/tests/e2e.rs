@@ -63,7 +63,12 @@ async fn e2e_http_auth_over_tcp() {
     let (invalid, _) = post_mcp(addr, Some("Bearer mcpm_nope"), INITIALIZE).await;
     assert_eq!(invalid, 401);
 
-    let (ok, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), INITIALIZE).await;
+    let (ok, body) = post_mcp(
+        addr,
+        Some(&format!("Bearer {}", issued.plaintext)),
+        INITIALIZE,
+    )
+    .await;
     assert_eq!(ok, 200);
     assert!(body.contains("mcp-manager"), "{body}");
     assert!(body.contains("jsonrpc"), "{body}");
@@ -80,7 +85,12 @@ async fn e2e_sqlite_token_survives_server_restart() {
 
     let tokens = TokenService::open_sqlite(&db).unwrap();
     let addr = spawn_server(Arc::new(Mutex::new(tokens))).await;
-    let (status, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), INITIALIZE).await;
+    let (status, body) = post_mcp(
+        addr,
+        Some(&format!("Bearer {}", issued.plaintext)),
+        INITIALIZE,
+    )
+    .await;
     assert_eq!(status, 200);
     assert!(body.contains("mcp-manager"), "{body}");
 }
@@ -91,6 +101,11 @@ async fn e2e_revoked_token_is_rejected_over_tcp() {
     let issued = tokens.issue("cursor");
     tokens.revoke(&issued.id).unwrap();
     let addr = spawn_server(Arc::new(Mutex::new(tokens))).await;
-    let (status, _) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), INITIALIZE).await;
+    let (status, _) = post_mcp(
+        addr,
+        Some(&format!("Bearer {}", issued.plaintext)),
+        INITIALIZE,
+    )
+    .await;
     assert_eq!(status, 401);
 }
