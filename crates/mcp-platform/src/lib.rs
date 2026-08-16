@@ -6,6 +6,7 @@
 
 mod app_paths;
 mod browser;
+#[cfg(target_os = "macos")]
 mod keychain;
 mod memory;
 mod secrets;
@@ -13,6 +14,7 @@ mod shell_env;
 
 pub use app_paths::{AppPaths, AppPathsError, NativeAppPaths};
 pub use browser::{BrowserError, BrowserOpener, NativeBrowserOpener};
+#[cfg(target_os = "macos")]
 pub use keychain::KeychainSecretStore;
 pub use memory::MemorySecretStore;
 pub use secrets::{
