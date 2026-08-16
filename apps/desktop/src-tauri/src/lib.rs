@@ -309,6 +309,9 @@ fn oauth_connected(secrets: State<AppSecrets>, id: String) -> Result<bool, Strin
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // GUI launches get launchd's minimal PATH; stdio servers need the user's
+    // login-shell PATH (npx, uvx, asdf shims). Must run before any spawns.
+    mcp_platform::fix_path_for_children();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
