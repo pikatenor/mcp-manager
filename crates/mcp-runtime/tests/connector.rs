@@ -133,13 +133,113 @@ fn remote_config(server_type: ServerType, url: String) -> ServerConfig {
 #[tokio::test]
 async fn streamable_http_lists_and_calls_with_bearer() {
     let addr = spawn_streamable(Some("secret-token")).await;
-    let config = remote_config(
-        ServerType::RemoteStreamable,
-        format!("http://{addr}/mcp"),
-    );
+    let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
     let mut secrets = HashMap::new();
     secrets.insert("BEARER_TOKEN".into(), "secret-token".into());
     let backend = McpConnector.connect(&config, &secrets).await.unwrap();
+    let tools = backend.list_tools().await.unwrap();
+    assert_eq!(tools[0].name, "echo");
+    let result = backend
+        .call_tool("echo", json!({ "q": "hi" }))
+        .await
+        .unwrap();
+    let text = result.to_string();
+    assert!(text.contains("echo"), "{text}");
+}
+
+fn sse_json(value: Value) -> Response {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(Body::from(format!("event: message\ndata: {value}\n\n")))
+        .unwrap()
+}
+
+/// Spec-strict streamable server, modeled on Atlassian's: POSTs must accept
+/// both `application/json` and `text/event-stream`, replies may be
+/// SSE-framed, and the `Mcp-Session-Id` from initialize must be echoed.
+async fn spawn_streamable_spec() -> SocketAddr {
+    const NOT_ACCEPTABLE: &str = "{\"jsonrpc\":\"2.0\",\"error\":{\"code\":-32000,\"message\":\"Not Acceptable: Client must accept both application/json and text/event-stream\"},\"id\":null}";
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = Router::new().route(
+        "/mcp",
+        post(move |request: Request<Body>| async move {
+            let accept = request
+                .headers()
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default();
+            if !(accept.contains("application/json") && accept.contains("text/event-stream")) {
+                return (StatusCode::NOT_ACCEPTABLE, NOT_ACCEPTABLE.to_string()).into_response();
+            }
+            let session = request
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+            let id = body.get("id").cloned();
+            let method = body
+                .get("method")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_none() {
+                if session.as_deref() != Some("sess-1") {
+                    return (StatusCode::NOT_FOUND, "unknown session".to_string()).into_response();
+                }
+                return StatusCode::ACCEPTED.into_response();
+            }
+            let id = id.unwrap();
+            match method.as_str() {
+                "initialize" => {
+                    let mut response = sse_json(json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "result": {
+                            "protocolVersion": "2025-03-26",
+                            "capabilities": { "tools": {} },
+                            "serverInfo": { "name": "spec-stub", "version": "0" }
+                        }
+                    }));
+                    response
+                        .headers_mut()
+                        .insert("mcp-session-id", "sess-1".parse().unwrap());
+                    response
+                }
+                "tools/list" | "tools/call" => {
+                    if session.as_deref() != Some("sess-1") {
+                        return (StatusCode::NOT_FOUND, "unknown session".to_string())
+                            .into_response();
+                    }
+                    handle_mcp(body)
+                }
+                _ => sse_json(json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "error": { "code": -32601, "message": "method not found" }
+                })),
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
+#[tokio::test]
+async fn streamable_http_sends_accept_and_parses_sse_responses() {
+    let addr = spawn_streamable_spec().await;
+    let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
+    let backend = McpConnector
+        .connect(&config, &HashMap::new())
+        .await
+        .unwrap();
     let tools = backend.list_tools().await.unwrap();
     assert_eq!(tools[0].name, "echo");
     let result = backend
