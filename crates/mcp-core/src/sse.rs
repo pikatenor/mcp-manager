@@ -37,6 +37,34 @@ pub fn parse_sse_endpoint_event(chunk: &str) -> Result<String, SseTransportError
     Err(SseTransportError::MissingEndpoint)
 }
 
+/// Parse JSON-RPC payloads (`message` events) from complete SSE blocks.
+/// Blocks without an `event:` field default to `message` per the SSE spec.
+pub fn parse_sse_message_events(chunk: &str) -> Vec<String> {
+    chunk
+        .split("\n\n")
+        .filter_map(|block| {
+            let mut event: Option<&str> = None;
+            let mut data = Vec::new();
+            for line in block.lines() {
+                if line.starts_with(':') {
+                    continue;
+                }
+                if let Some(value) = line.strip_prefix("event:") {
+                    event = Some(value.trim());
+                } else if let Some(value) = line.strip_prefix("data:") {
+                    data.push(value.trim_start());
+                }
+            }
+            let is_message = event.is_none() || event == Some("message");
+            if is_message && !data.is_empty() {
+                Some(data.join("\n"))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
 /// Legacy HTTP+SSE client (`2024-11-05`): GET event stream, POST to endpoint URL.
 pub struct SseClientTransport {
     pub endpoint_url: String,
@@ -123,6 +151,38 @@ mod tests {
             parse_sse_endpoint_event(chunk).unwrap(),
             "http://127.0.0.1:9/mcp/messages"
         );
+    }
+
+    #[test]
+    fn parses_message_event_payloads() {
+        let chunk = "event: message\ndata: {\"jsonrpc\":\"2.0\"}\n\nevent: ping\ndata: {}\n\n";
+        assert_eq!(
+            parse_sse_message_events(chunk),
+            vec!["{\"jsonrpc\":\"2.0\"}".to_string()]
+        );
+    }
+
+    #[test]
+    fn data_without_event_field_is_a_message() {
+        assert_eq!(
+            parse_sse_message_events("data: {\"id\":1}\n\n"),
+            vec!["{\"id\":1}".to_string()]
+        );
+    }
+
+    #[test]
+    fn multi_line_data_is_joined() {
+        let chunk = "event: message\ndata: {\"a\":\ndata: 1}\n\n";
+        assert_eq!(
+            parse_sse_message_events(chunk),
+            vec!["{\"a\":\n1}".to_string()]
+        );
+    }
+
+    #[test]
+    fn comments_and_empty_blocks_are_ignored() {
+        let chunk = ": keep-alive\n\nevent: message\ndata: {}\n\n\n";
+        assert_eq!(parse_sse_message_events(chunk), vec!["{}".to_string()]);
     }
 
     #[test]
