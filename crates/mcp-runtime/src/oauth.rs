@@ -232,7 +232,8 @@ impl OAuthFlow {
 
         let verifier = random_b64(32);
         let state = random_b64(16);
-        let mut authorize = Url::parse(authorization_endpoint).map_err(|err| fail(err.to_string()))?;
+        let mut authorize =
+            Url::parse(authorization_endpoint).map_err(|err| fail(err.to_string()))?;
         authorize
             .query_pairs_mut()
             .append_pair("response_type", "code")

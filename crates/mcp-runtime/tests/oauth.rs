@@ -45,9 +45,15 @@ impl OAuthHttp for FakeHttp {
         url: &str,
         form: HashMap<String, String>,
     ) -> Result<Value, OAuthError> {
-        self.forms.lock().unwrap().push((url.to_string(), form.clone()));
+        self.forms
+            .lock()
+            .unwrap()
+            .push((url.to_string(), form.clone()));
         if url.ends_with("/token") {
-            assert_eq!(form.get("grant_type").map(String::as_str), Some("authorization_code"));
+            assert_eq!(
+                form.get("grant_type").map(String::as_str),
+                Some("authorization_code")
+            );
             assert_eq!(form.get("code").map(String::as_str), Some("auth-code"));
             assert!(form.contains_key("code_verifier"));
             return Ok(json!({
@@ -115,17 +121,17 @@ async fn authorize_pkce_loopback_stores_tokens() {
     });
     drop(flow);
 
-    let auth_url = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        browser.wait_url(),
-    )
-    .await
-    .expect("browser opened");
+    let auth_url = tokio::time::timeout(std::time::Duration::from_secs(2), browser.wait_url())
+        .await
+        .expect("browser opened");
     let parsed = Url::parse(&auth_url).unwrap();
     assert_eq!(parsed.host_str(), Some("auth.example"));
     let pairs: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
     assert_eq!(pairs.get("client_id").map(String::as_str), Some("cid-1"));
-    assert_eq!(pairs.get("code_challenge_method").map(String::as_str), Some("S256"));
+    assert_eq!(
+        pairs.get("code_challenge_method").map(String::as_str),
+        Some("S256")
+    );
     assert!(pairs.contains_key("code_challenge"));
     let state = pairs.get("state").cloned().unwrap();
     let redirect = pairs.get("redirect_uri").cloned().unwrap();
@@ -177,10 +183,7 @@ async fn authorize_rejects_plain_http_public_host() {
     });
     let secrets = Arc::new(MemorySecretStore::new());
     let flow = OAuthFlow::new(http, browser, secrets);
-    let err = match flow
-        .authorize("srv-1", "http://example.com/mcp")
-        .await
-    {
+    let err = match flow.authorize("srv-1", "http://example.com/mcp").await {
         Err(err) => err,
         Ok(()) => panic!("expected url rejection"),
     };

@@ -5,7 +5,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use super::aggregator::{AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer};
+use super::aggregator::{
+    AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer,
+};
 use super::remote_url::validate_remote_url;
 use super::servers::{ServerConfig, ServerStore, ServerType};
 use super::store::StoreError;
@@ -63,9 +65,10 @@ fn validate_config(config: &ServerConfig) -> Result<(), RegistryError> {
     match config.server_type {
         ServerType::Local => Ok(()),
         ServerType::Remote | ServerType::RemoteStreamable => {
-            let url = config.remote_url.as_deref().ok_or_else(|| {
-                RegistryError::InvalidConfig("remote_url is required".into())
-            })?;
+            let url = config
+                .remote_url
+                .as_deref()
+                .ok_or_else(|| RegistryError::InvalidConfig("remote_url is required".into()))?;
             validate_remote_url(url)?;
             Ok(())
         }
@@ -152,13 +155,16 @@ impl ServerRegistry {
             .insert(config.id.clone(), ServerStatus::Starting);
         match self.connector.connect(&config, &secrets).await {
             Ok(backend) => {
-                self.aggregator.lock().await.upsert_server(RegisteredServer {
-                    id: config.id.clone(),
-                    name: config.name.clone(),
-                    running: true,
-                    tool_permissions: config.tool_permissions.clone(),
-                    backend,
-                });
+                self.aggregator
+                    .lock()
+                    .await
+                    .upsert_server(RegisteredServer {
+                        id: config.id.clone(),
+                        name: config.name.clone(),
+                        running: true,
+                        tool_permissions: config.tool_permissions.clone(),
+                        backend,
+                    });
                 self.statuses
                     .insert(config.id.clone(), ServerStatus::Running);
                 self.errors.remove(&config.id);
@@ -339,9 +345,7 @@ mod tests {
         let connector = RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]);
         let mut registry = ServerRegistry::open_sqlite(&path, connector.clone()).unwrap();
         let mut config = local_config("srv-1", "everything");
-        config
-            .tool_permissions
-            .insert("delete".into(), false);
+        config.tool_permissions.insert("delete".into(), false);
         registry.add(config).unwrap();
 
         let mut secrets = HashMap::new();
@@ -369,11 +373,9 @@ mod tests {
     async fn stop_hides_tools() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let mut registry = ServerRegistry::open_sqlite(
-            &path,
-            RecordingConnector::with_tools(vec![tool("echo")]),
-        )
-        .unwrap();
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
+                .unwrap();
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         registry.stop("srv-1").await.unwrap();
@@ -419,11 +421,9 @@ mod tests {
     async fn shared_aggregator_handle_lists_started_tools() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let mut registry = ServerRegistry::open_sqlite(
-            &path,
-            RecordingConnector::with_tools(vec![tool("echo")]),
-        )
-        .unwrap();
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
+                .unwrap();
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         let tools = registry
@@ -440,11 +440,9 @@ mod tests {
     async fn delete_stops_and_removes() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
-        let mut registry = ServerRegistry::open_sqlite(
-            &path,
-            RecordingConnector::with_tools(vec![tool("echo")]),
-        )
-        .unwrap();
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
+                .unwrap();
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         assert!(registry.delete("srv-1").await.unwrap());
