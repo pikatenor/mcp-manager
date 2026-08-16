@@ -47,17 +47,20 @@ fn new_server_id() -> String {
     format!("srv-{nanos:x}")
 }
 
-fn load_secrets(store: &dyn SecretStore, config: &ServerConfig) -> HashMap<String, String> {
+fn load_secrets(
+    store: &dyn SecretStore,
+    config: &ServerConfig,
+) -> Result<HashMap<String, String>, SecretStoreError> {
     let mut secrets = HashMap::new();
     for key in &config.env_keys {
-        if let Ok(Some(value)) = store.get(&server_env_key(&config.id, key)) {
+        if let Some(value) = store.get(&server_env_key(&config.id, key))? {
             secrets.insert(key.clone(), value);
         }
     }
-    if let Ok(Some(bearer)) = store.get(&server_bearer_key(&config.id)) {
+    if let Some(bearer) = store.get(&server_bearer_key(&config.id))? {
         secrets.insert("BEARER_TOKEN".into(), bearer);
     }
-    secrets
+    Ok(secrets)
 }
 
 fn persist_secrets(
@@ -198,7 +201,7 @@ async fn start_server(
         .find(|state| state.config.id == id)
         .ok_or_else(|| format!("unknown server: {id}"))?
         .config;
-    let server_secrets = load_secrets(secrets.0.as_ref(), &config);
+    let server_secrets = load_secrets(secrets.0.as_ref(), &config).map_err(|e| e.to_string())?;
     registry
         .start(&id, server_secrets)
         .await
@@ -353,10 +356,14 @@ pub fn run() {
                     let mut all_secrets = HashMap::new();
                     if let Ok(listed) = registry.list() {
                         for state in listed {
-                            all_secrets.insert(
-                                state.config.id.clone(),
-                                load_secrets(secrets.as_ref(), &state.config),
-                            );
+                            match load_secrets(secrets.as_ref(), &state.config) {
+                                Ok(server_secrets) => {
+                                    all_secrets.insert(state.config.id.clone(), server_secrets);
+                                }
+                                Err(error) => {
+                                    eprintln!("secret load failed for {}: {error}", state.config.id)
+                                }
+                            }
                         }
                     }
                     if let Err(error) = registry.auto_start(all_secrets).await {

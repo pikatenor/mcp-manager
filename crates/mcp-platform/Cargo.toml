@@ -8,4 +8,6 @@ description = "OS adapters (secrets, paths, browser) behind traits"
 [dependencies]
 thiserror.workspace = true
 dirs.workspace = true
-keyring.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { workspace = true, features = ["apple-native"] }
