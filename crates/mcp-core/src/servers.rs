@@ -49,7 +49,9 @@ fn type_from_sql(value: &str) -> Result<ServerType, StoreError> {
         "local" => Ok(ServerType::Local),
         "remote" => Ok(ServerType::Remote),
         "remote-streamable" => Ok(ServerType::RemoteStreamable),
-        other => Err(StoreError::Database(format!("unknown server type: {other}"))),
+        other => Err(StoreError::Database(format!(
+            "unknown server type: {other}"
+        ))),
     }
 }
 
@@ -135,7 +137,9 @@ impl ServerStore {
                  ORDER BY name, id",
             )
             .map_err(db_err)?;
-        let rows = stmt.query_map([], |row| Ok(row_to_config(row))).map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| Ok(row_to_config(row)))
+            .map_err(db_err)?;
         let mut configs = Vec::new();
         for row in rows {
             configs.push(row.map_err(db_err)??);
@@ -215,7 +219,10 @@ mod tests {
             name: name.into(),
             server_type: ServerType::Local,
             command: Some("npx".into()),
-            args: vec!["-y".into(), "@modelcontextprotocol/server-everything".into()],
+            args: vec![
+                "-y".into(),
+                "@modelcontextprotocol/server-everything".into(),
+            ],
             env_keys: vec!["API_TOKEN".into()],
             remote_url: None,
             auto_start: true,
@@ -238,9 +245,8 @@ mod tests {
         assert_eq!(loaded.server_type, ServerType::Local);
         assert_eq!(loaded.env_keys, vec!["API_TOKEN"]);
         assert_eq!(loaded.tool_permissions.get("delete"), Some(&false));
-        let raw = fs::read_to_string(&path).unwrap_or_else(|_| {
-            String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned()
-        });
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|_| String::from_utf8_lossy(&fs::read(&path).unwrap()).into_owned());
         assert!(
             !raw.contains("sk-secret"),
             "sqlite must not store secret values"

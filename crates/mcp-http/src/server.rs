@@ -27,10 +27,7 @@ pub fn router_with_aggregator(
     tokens: Arc<Mutex<TokenService>>,
     aggregator: Arc<AsyncMutex<Aggregator>>,
 ) -> Router {
-    let state = AppState {
-        tokens,
-        aggregator,
-    };
+    let state = AppState { tokens, aggregator };
     Router::new()
         .route("/mcp", post(mcp_handler))
         .route_layer(from_fn_with_state(state.clone(), require_token))
@@ -277,7 +274,8 @@ mod tests {
             .unwrap();
         let status = res.status();
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
-        let json = serde_json::from_slice(&bytes).unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }));
+        let json = serde_json::from_slice(&bytes)
+            .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }));
         (status, json)
     }
 
