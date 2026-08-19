@@ -14,7 +14,7 @@ use mcp_platform::{
 use mcp_platform::KeychainSecretStore;
 #[cfg(not(target_os = "macos"))]
 use mcp_platform::MemorySecretStore;
-use mcp_runtime::{McpConnector, OAuthFlow, ReqwestOAuthHttp};
+use mcp_runtime::{McpConnector, OAuthFlow};
 use serde::{Deserialize, Serialize};
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::TrayIconBuilder;
@@ -90,6 +90,7 @@ fn delete_secrets(store: &dyn SecretStore, config: &ServerConfig) {
     let _ = store.delete(&server_oauth_key(&config.id, "access_token"));
     let _ = store.delete(&server_oauth_key(&config.id, "refresh_token"));
     let _ = store.delete(&server_oauth_key(&config.id, "client_id"));
+    let _ = store.delete(&server_oauth_key(&config.id, "credentials"));
 }
 
 #[tauri::command]
@@ -299,11 +300,7 @@ async fn oauth_connect(
             .remote_url
             .ok_or_else(|| "remote_url is required".to_string())?
     };
-    let flow = OAuthFlow::new(
-        Arc::new(ReqwestOAuthHttp::new().map_err(|e| e.to_string())?),
-        Arc::new(NativeBrowserOpener),
-        secrets.0.clone(),
-    );
+    let flow = OAuthFlow::new(Arc::new(NativeBrowserOpener), secrets.0.clone());
     flow.authorize(&id, &remote_url)
         .await
         .map_err(|e| e.to_string())
@@ -346,16 +343,18 @@ pub fn run() {
             std::fs::create_dir_all(&data_dir)?;
             let tokens = TokenService::open_sqlite(&data_dir.join("tokens.db"))?;
             let tokens = Arc::new(Mutex::new(tokens));
-            let registry =
-                ServerRegistry::open_sqlite(&data_dir.join("state.db"), Arc::new(McpConnector))?;
-            let aggregator = registry.aggregator();
-            let registry = Arc::new(AsyncMutex::new(registry));
             #[cfg(target_os = "macos")]
             let secrets: Arc<dyn SecretStore> = Arc::new(KeychainSecretStore::new());
             // Linux Secret Service wiring is deferred; MemorySecretStore keeps
             // the Ubuntu CI compile/test path working until then.
             #[cfg(not(target_os = "macos"))]
             let secrets: Arc<dyn SecretStore> = Arc::new(MemorySecretStore::new());
+            let registry = ServerRegistry::open_sqlite(
+                &data_dir.join("state.db"),
+                Arc::new(McpConnector::new(secrets.clone())),
+            )?;
+            let aggregator = registry.aggregator();
+            let registry = Arc::new(AsyncMutex::new(registry));
             app.manage(AppTokens(tokens.clone()));
             app.manage(AppRegistry(registry.clone()));
             app.manage(AppSecrets(secrets.clone()));
