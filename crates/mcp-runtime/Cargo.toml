@@ -11,14 +11,16 @@ path = "fixtures/stdio_fixture.rs"
 
 [dependencies]
 async-trait.workspace = true
+futures.workspace = true
+http.workspace = true
 mcp-core.workspace = true
 mcp-platform.workspace = true
+oauth2.workspace = true
 reqwest.workspace = true
 rmcp.workspace = true
 serde.workspace = true
+sse-stream.workspace = true
 serde_json.workspace = true
-sha2.workspace = true
-rand.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 url.workspace = true
