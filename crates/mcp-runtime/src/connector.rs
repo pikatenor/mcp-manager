@@ -1,27 +1,50 @@
 use std::collections::HashMap;
 use std::process::Stdio;
+use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream::BoxStream;
+use http::{HeaderName, HeaderValue};
 use mcp_core::{
     parse_sse_message_events, validate_remote_url, AggregatorError, BackendConnector, McpBackend,
     RegistryError, ServerConfig, ServerType, SseClientTransport, Tool,
 };
+use mcp_platform::SecretStore;
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
 use rmcp::service::{RoleClient, RunningService};
+use rmcp::transport::auth::{AuthError, AuthorizationManager};
 use rmcp::transport::child_process::TokioChildProcess;
-use rmcp::transport::streamable_http_client::StreamableHttpClientTransportConfig;
+use rmcp::transport::streamable_http_client::{
+    SseError, StreamableHttpError, StreamableHttpPostResponse, StreamableHttpClient,
+    StreamableHttpClientTransportConfig,
+};
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{serve_client, ClientHandler};
 use serde_json::{json, Value};
+use sse_stream::Sse;
 use tokio::process::Command;
 use tokio::sync::Mutex;
+
+use crate::oauth::KeychainCredentialStore;
 
 /// Connects to local stdio, remote Streamable HTTP, or legacy HTTP+SSE servers.
 /// stdio and Streamable HTTP ride on rmcp; the deprecated HTTP+SSE transport
 /// (2024-11-05) keeps the hand-rolled JSON-RPC client below because rmcp no
 /// longer ships a client for it.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct McpConnector;
+#[derive(Clone, Default)]
+pub struct McpConnector {
+    /// Secret store for OAuth credential persistence. When absent, remote
+    /// servers fall back to the static bearer from the secrets map.
+    secrets: Option<Arc<dyn SecretStore>>,
+}
+
+impl McpConnector {
+    pub fn new(secrets: Arc<dyn SecretStore>) -> Self {
+        Self {
+            secrets: Some(secrets),
+        }
+    }
+}
 
 /// Presents the aggregator's identity during the MCP handshake.
 struct AggregatorClient;
@@ -102,8 +125,23 @@ async fn connect_rmcp_stdio(
 async fn connect_rmcp_http(
     url: &str,
     secrets: &HashMap<String, String>,
+    store: Option<&Arc<dyn SecretStore>>,
+    server_id: &str,
 ) -> Result<RmcpBackend, RegistryError> {
     validate_remote_url(url)?;
+    // Refresh-aware OAuth credentials take precedence over a static bearer.
+    if let Some(store) = store {
+        if let Some(manager) = oauth_manager(url, store.clone(), server_id).await? {
+            let transport = StreamableHttpClientTransport::with_client(
+                RefreshingHttpClient::new(manager)?,
+                StreamableHttpClientTransportConfig::with_uri(url.to_string()),
+            );
+            let service = serve_client(AggregatorClient, transport)
+                .await
+                .map_err(|err| RegistryError::Backend(err.to_string()))?;
+            return Ok(RmcpBackend { service });
+        }
+    }
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
     if let Some(token) = bearer_from(secrets) {
         // rmcp applies the Bearer scheme itself via `bearer_auth`.
@@ -114,6 +152,245 @@ async fn connect_rmcp_http(
         .await
         .map_err(|err| RegistryError::Backend(err.to_string()))?;
     Ok(RmcpBackend { service })
+}
+
+/// Build an `AuthorizationManager` over stored OAuth credentials. Returns
+/// `None` when the server has none (static bearer applies instead).
+async fn oauth_manager(
+    url: &str,
+    store: Arc<dyn SecretStore>,
+    server_id: &str,
+) -> Result<Option<Arc<AuthorizationManager>>, RegistryError> {
+    let mut manager = AuthorizationManager::new(url.to_string())
+        .await
+        .map_err(|err| RegistryError::Backend(err.to_string()))?;
+    manager.set_credential_store(KeychainCredentialStore::new(store, server_id));
+    let initialized = manager
+        .initialize_from_store()
+        .await
+        .map_err(|err| RegistryError::Backend(err.to_string()))?;
+    Ok(initialized.then(|| Arc::new(manager)))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum AuthHttpError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
+    Http(#[from] reqwest::Error),
+}
+
+/// `StreamableHttpError` is non-exhaustive, so unknown future variants are
+/// stringified rather than dropped.
+fn map_http_error(
+    error: StreamableHttpError<reqwest::Error>,
+) -> StreamableHttpError<AuthHttpError> {
+    match error {
+        StreamableHttpError::Client(err) => StreamableHttpError::Client(err.into()),
+        StreamableHttpError::Sse(err) => StreamableHttpError::Sse(err),
+        StreamableHttpError::Io(err) => StreamableHttpError::Io(err),
+        StreamableHttpError::UnexpectedEndOfStream => StreamableHttpError::UnexpectedEndOfStream,
+        StreamableHttpError::UnexpectedServerResponse(message) => {
+            StreamableHttpError::UnexpectedServerResponse(message)
+        }
+        StreamableHttpError::UnexpectedContentType(content_type) => {
+            StreamableHttpError::UnexpectedContentType(content_type)
+        }
+        StreamableHttpError::ServerDoesNotSupportSse => {
+            StreamableHttpError::ServerDoesNotSupportSse
+        }
+        StreamableHttpError::ServerDoesNotSupportDeleteSession => {
+            StreamableHttpError::ServerDoesNotSupportDeleteSession
+        }
+        StreamableHttpError::TokioJoinError(err) => StreamableHttpError::TokioJoinError(err),
+        StreamableHttpError::Deserialize(err) => StreamableHttpError::Deserialize(err),
+        StreamableHttpError::TransportChannelClosed => StreamableHttpError::TransportChannelClosed,
+        StreamableHttpError::MissingSessionIdInResponse => {
+            StreamableHttpError::MissingSessionIdInResponse
+        }
+        StreamableHttpError::Auth(err) => StreamableHttpError::Auth(err),
+        StreamableHttpError::AuthRequired(err) => StreamableHttpError::AuthRequired(err),
+        StreamableHttpError::InsufficientScope(err) => StreamableHttpError::InsufficientScope(err),
+        StreamableHttpError::ReservedHeaderConflict(name) => {
+            StreamableHttpError::ReservedHeaderConflict(name)
+        }
+        StreamableHttpError::SessionExpired => StreamableHttpError::SessionExpired,
+        other => StreamableHttpError::UnexpectedServerResponse(std::borrow::Cow::Owned(
+            other.to_string(),
+        )),
+    }
+}
+
+fn is_auth_rejection<E>(error: &StreamableHttpError<E>) -> bool
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    matches!(error, StreamableHttpError::AuthRequired(_))
+        || matches!(
+            error,
+            StreamableHttpError::UnexpectedServerResponse(message) if message.contains("401")
+        )
+}
+
+/// Streamable HTTP backend that pulls the bearer from the OAuth manager on
+/// every request (refreshing near expiry) and retries once through a forced
+/// refresh when the server rejects the token with a 401 challenge.
+#[derive(Clone)]
+struct RefreshingHttpClient {
+    inner: reqwest::Client,
+    manager: Arc<AuthorizationManager>,
+}
+
+impl RefreshingHttpClient {
+    fn new(manager: Arc<AuthorizationManager>) -> Result<Self, RegistryError> {
+        // Mirror rmcp's default backend: no pooled connections (avoid ACK
+        // stalls) and no redirects (never replay auth headers).
+        let inner = reqwest::Client::builder()
+            .pool_max_idle_per_host(0)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|err| RegistryError::Backend(err.to_string()))?;
+        Ok(Self { inner, manager })
+    }
+
+    async fn access_token(&self) -> Result<Option<String>, StreamableHttpError<AuthHttpError>> {
+        self.manager
+            .get_access_token()
+            .await
+            .map(Some)
+            .map_err(|err| StreamableHttpError::Client(AuthHttpError::Auth(err)))
+    }
+
+    async fn force_refresh(&self) -> Result<(), StreamableHttpError<AuthHttpError>> {
+        self.manager
+            .refresh_token()
+            .await
+            .map(|_| ())
+            .map_err(|err| StreamableHttpError::Client(AuthHttpError::Auth(err)))
+    }
+}
+
+// rmcp's default raw-SSE event bound (its `DEFAULT_MAX_SSE_EVENT_SIZE`).
+const MAX_SSE_EVENT_SIZE: usize = 16 * 1024 * 1024;
+
+impl StreamableHttpClient for RefreshingHttpClient {
+    type Error = AuthHttpError;
+
+    async fn post_message(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        self.post_message_with_max_sse_event_size(
+            uri,
+            message,
+            session_id,
+            _auth_header,
+            custom_headers,
+            MAX_SSE_EVENT_SIZE,
+        )
+        .await
+    }
+
+    async fn post_message_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        message: rmcp::model::ClientJsonRpcMessage,
+        session_id: Option<Arc<str>>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<StreamableHttpPostResponse, StreamableHttpError<Self::Error>> {
+        let token = self.access_token().await?;
+        match self
+            .inner
+            .post_message_with_max_sse_event_size(
+                uri.clone(),
+                message.clone(),
+                session_id.clone(),
+                token,
+                custom_headers.clone(),
+                max_sse_event_size,
+            )
+            .await
+        {
+            Err(err) if is_auth_rejection(&err) => {
+                self.force_refresh().await?;
+                let token = self.access_token().await?;
+                self.inner
+                    .post_message_with_max_sse_event_size(
+                        uri,
+                        message,
+                        session_id,
+                        token,
+                        custom_headers,
+                        max_sse_event_size,
+                    )
+                    .await
+                    .map_err(map_http_error)
+            }
+            other => other.map_err(map_http_error),
+        }
+    }
+
+    async fn delete_session(
+        &self,
+        uri: Arc<str>,
+        session_id: Arc<str>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<(), StreamableHttpError<Self::Error>> {
+        let token = self.access_token().await?;
+        self.inner
+            .delete_session(uri, session_id, token, custom_headers)
+            .await
+            .map_err(map_http_error)
+    }
+
+    async fn get_stream(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        self.get_stream_with_max_sse_event_size(
+            uri,
+            session_id,
+            last_event_id,
+            _auth_header,
+            custom_headers,
+            MAX_SSE_EVENT_SIZE,
+        )
+        .await
+    }
+
+    async fn get_stream_with_max_sse_event_size(
+        &self,
+        uri: Arc<str>,
+        session_id: Option<Arc<str>>,
+        last_event_id: Option<String>,
+        _auth_header: Option<String>,
+        custom_headers: HashMap<HeaderName, HeaderValue>,
+        max_sse_event_size: usize,
+    ) -> Result<BoxStream<'static, Result<Sse, SseError>>, StreamableHttpError<Self::Error>> {
+        let token = self.access_token().await?;
+        self.inner
+            .get_stream_with_max_sse_event_size(
+                uri,
+                session_id,
+                last_event_id,
+                token,
+                custom_headers,
+                max_sse_event_size,
+            )
+            .await
+            .map_err(map_http_error)
+    }
 }
 
 // ---- legacy HTTP+SSE (2024-11-05) backend ----
@@ -361,9 +638,10 @@ impl BackendConnector for McpConnector {
         };
         let backend: std::sync::Arc<dyn McpBackend> = match config.server_type {
             ServerType::Local => std::sync::Arc::new(connect_rmcp_stdio(config, secrets).await?),
-            ServerType::RemoteStreamable => {
-                std::sync::Arc::new(connect_rmcp_http(require_url()?, secrets).await?)
-            }
+            ServerType::RemoteStreamable => std::sync::Arc::new(
+                connect_rmcp_http(require_url()?, secrets, self.secrets.as_ref(), &config.id)
+                    .await?,
+            ),
             ServerType::Remote => std::sync::Arc::new(connect_sse(require_url()?, secrets).await?),
         };
         Ok(backend)

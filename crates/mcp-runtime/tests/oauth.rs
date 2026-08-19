@@ -1,188 +1,148 @@
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use axum::body::Body;
+use axum::extract::{Query, RawForm};
+use axum::http::{header, StatusCode};
+use axum::response::Response;
+use axum::routing::{get, post};
+use axum::Router;
 use mcp_platform::{
     server_bearer_key, server_oauth_key, BrowserError, BrowserOpener, MemorySecretStore,
     SecretStore,
 };
-use mcp_runtime::{OAuthError, OAuthFlow, OAuthHttp};
+use mcp_runtime::{OAuthError, OAuthFlow};
 use serde_json::{json, Value};
-use tokio::sync::Notify;
-use url::Url;
+use tokio::net::TcpListener;
 
-struct FakeHttp {
-    well_known: Value,
-    client_id: String,
-    access_token: String,
-    refresh_token: String,
-    posts: Mutex<Vec<(String, Value)>>,
-    forms: Mutex<Vec<(String, HashMap<String, String>)>>,
-}
+/// Opens the authorization URL like a real browser: GET it and follow the
+/// redirect onto the flow's loopback listener.
+struct HeadlessBrowser;
 
 #[async_trait]
-impl OAuthHttp for FakeHttp {
-    async fn get_json(&self, url: &str) -> Result<Value, OAuthError> {
-        if url.contains("/.well-known/oauth-authorization-server") {
-            return Ok(self.well_known.clone());
-        }
-        Err(OAuthError::Failed(format!("unexpected GET {url}")))
-    }
-
-    async fn post_json(&self, url: &str, body: Value) -> Result<Value, OAuthError> {
-        self.posts.lock().unwrap().push((url.to_string(), body));
-        if url.ends_with("/register") {
-            return Ok(json!({
-                "client_id": self.client_id,
-                "client_secret": "cs"
-            }));
-        }
-        Err(OAuthError::Failed(format!("unexpected POST JSON {url}")))
-    }
-
-    async fn post_form(
-        &self,
-        url: &str,
-        form: HashMap<String, String>,
-    ) -> Result<Value, OAuthError> {
-        self.forms
-            .lock()
-            .unwrap()
-            .push((url.to_string(), form.clone()));
-        if url.ends_with("/token") {
-            assert_eq!(
-                form.get("grant_type").map(String::as_str),
-                Some("authorization_code")
-            );
-            assert_eq!(form.get("code").map(String::as_str), Some("auth-code"));
-            assert!(form.contains_key("code_verifier"));
-            return Ok(json!({
-                "access_token": self.access_token,
-                "refresh_token": self.refresh_token,
-                "token_type": "Bearer"
-            }));
-        }
-        Err(OAuthError::Failed(format!("unexpected POST form {url}")))
-    }
-}
-
-struct RecordingBrowser {
-    url: Mutex<Option<String>>,
-    notify: Notify,
-}
-
-impl BrowserOpener for RecordingBrowser {
+impl BrowserOpener for HeadlessBrowser {
     fn open_url(&self, url: &str) -> Result<(), BrowserError> {
-        *self.url.lock().unwrap() = Some(url.to_string());
-        self.notify.notify_waiters();
+        let url = url.to_string();
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let _ = client.get(&url).send().await;
+        });
         Ok(())
     }
 }
 
-impl RecordingBrowser {
-    async fn wait_url(&self) -> String {
-        loop {
-            if let Some(url) = self.url.lock().unwrap().clone() {
-                return url;
-            }
-            self.notify.notified().await;
-        }
-    }
-}
-
-fn metadata() -> Value {
-    json!({
-        "issuer": "https://auth.example",
-        "authorization_endpoint": "https://auth.example/authorize",
-        "token_endpoint": "https://auth.example/token",
-        "registration_endpoint": "https://auth.example/register"
-    })
+/// Fake authorization server speaking real HTTP so rmcp's manager drives the
+/// full flow: discovery, dynamic registration, PKCE authorize, token exchange.
+async fn spawn_fake_as() -> (SocketAddr, Arc<Mutex<Vec<HashMap<String, String>>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let origin = format!("http://{addr}");
+    let token_requests: Arc<Mutex<Vec<HashMap<String, String>>>> = Arc::default();
+    let requests = token_requests.clone();
+    let metadata = json!({
+        // The path-inserted discovery form implies an issuer with the same path.
+        "issuer": format!("{origin}/mcp"),
+        "authorization_endpoint": format!("{origin}/authorize"),
+        "token_endpoint": format!("{origin}/token"),
+        "registration_endpoint": format!("{origin}/register"),
+    });
+    let app = Router::new()
+        .route(
+            "/.well-known/oauth-authorization-server/mcp",
+            get(move || async move { axum::Json(metadata.clone()) }),
+        )
+        .route(
+            "/register",
+            post(|body: String| async move {
+                let request: Value = serde_json::from_str(&body).unwrap_or(json!({}));
+                axum::Json(json!({
+                    "client_id": "cid-1",
+                    "redirect_uris": request["redirect_uris"].clone(),
+                }))
+            }),
+        )
+        .route(
+            "/authorize",
+            get(|Query(params): Query<HashMap<String, String>>| async move {
+                let redirect = params.get("redirect_uri").cloned().unwrap_or_default();
+                let state = params.get("state").cloned().unwrap_or_default();
+                Response::builder()
+                    .status(StatusCode::FOUND)
+                    .header(
+                        header::LOCATION,
+                        format!("{redirect}?code=auth-code&state={state}"),
+                    )
+                    .body(Body::empty())
+                    .unwrap()
+            }),
+        )
+        .route(
+            "/token",
+            post(
+                move |RawForm(form): RawForm| async move {
+                    let pairs: HashMap<String, String> =
+                        url::form_urlencoded::parse(&form).into_owned().collect();
+                    requests.lock().unwrap().push(pairs);
+                    axum::Json(json!({
+                        "access_token": "at-123",
+                        "refresh_token": "rt-123",
+                        "token_type": "Bearer",
+                        "expires_in": 3600
+                    }))
+                },
+            ),
+        );
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (addr, token_requests)
 }
 
 #[tokio::test]
-async fn authorize_pkce_loopback_stores_tokens() {
-    let http = Arc::new(FakeHttp {
-        well_known: metadata(),
-        client_id: "cid-1".into(),
-        access_token: "at-123".into(),
-        refresh_token: "rt-123".into(),
-        posts: Mutex::new(Vec::new()),
-        forms: Mutex::new(Vec::new()),
-    });
-    let browser = Arc::new(RecordingBrowser {
-        url: Mutex::new(None),
-        notify: Notify::new(),
-    });
+async fn authorize_stores_credentials_and_mirrors_bearer() {
+    let (as_addr, token_requests) = spawn_fake_as().await;
     let secrets = Arc::new(MemorySecretStore::new());
-    let flow = OAuthFlow::new(http.clone(), browser.clone(), secrets.clone());
-    let task = tokio::spawn({
-        let flow = OAuthFlow::new(http.clone(), browser.clone(), secrets.clone());
-        async move { flow.authorize("srv-1", "https://mcp.example.com/mcp").await }
-    });
-    drop(flow);
-
-    let auth_url = tokio::time::timeout(std::time::Duration::from_secs(2), browser.wait_url())
+    let flow = OAuthFlow::new(Arc::new(HeadlessBrowser), secrets.clone());
+    flow.authorize("srv-1", &format!("http://{as_addr}/mcp"))
         .await
-        .expect("browser opened");
-    let parsed = Url::parse(&auth_url).unwrap();
-    assert_eq!(parsed.host_str(), Some("auth.example"));
-    let pairs: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
-    assert_eq!(pairs.get("client_id").map(String::as_str), Some("cid-1"));
-    assert_eq!(
-        pairs.get("code_challenge_method").map(String::as_str),
-        Some("S256")
-    );
-    assert!(pairs.contains_key("code_challenge"));
-    let state = pairs.get("state").cloned().unwrap();
-    let redirect = pairs.get("redirect_uri").cloned().unwrap();
-    assert!(redirect.starts_with("http://127.0.0.1:"));
-    assert!(redirect.contains("/oauth/callback"));
+        .expect("authorize should succeed");
 
-    let (register_url, register_body) = http.posts.lock().unwrap()[0].clone();
-    assert!(register_url.ends_with("/register"));
-    let redirect_uris = register_body["redirect_uris"].as_array().unwrap();
-    assert_eq!(redirect_uris[0].as_str(), Some(redirect.as_str()));
+    // The code exchange carried the authorization code and PKCE verifier.
+    let exchange = token_requests.lock().unwrap()[0].clone();
+    assert_eq!(exchange["grant_type"], "authorization_code");
+    assert_eq!(exchange["code"], "auth-code");
+    assert!(exchange.contains_key("code_verifier"));
 
-    let callback = format!("{redirect}?code=auth-code&state={state}");
-    reqwest::Client::builder()
-        .no_proxy()
-        .build()
-        .unwrap()
-        .get(&callback)
-        .send()
-        .await
-        .unwrap();
+    // rmcp's credential blob landed in the store with both tokens.
+    let blob = secrets
+        .get(&server_oauth_key("srv-1", "credentials"))
+        .expect("store read")
+        .expect("credentials blob stored");
+    let parsed: Value = serde_json::from_str(&blob).unwrap();
+    assert_eq!(parsed["client_id"], "cid-1");
+    assert_eq!(parsed["token_response"]["access_token"], "at-123");
+    assert_eq!(parsed["token_response"]["refresh_token"], "rt-123");
 
-    task.await.unwrap().unwrap();
+    // The access token is mirrored for the UI and the legacy bearer path.
     assert_eq!(
         secrets.get(&server_bearer_key("srv-1")).unwrap().as_deref(),
         Some("at-123")
     );
     assert_eq!(
         secrets
-            .get(&server_oauth_key("srv-1", "refresh_token"))
+            .get(&server_oauth_key("srv-1", "access_token"))
             .unwrap()
             .as_deref(),
-        Some("rt-123")
+        Some("at-123")
     );
 }
 
 #[tokio::test]
 async fn authorize_rejects_plain_http_public_host() {
-    let http = Arc::new(FakeHttp {
-        well_known: metadata(),
-        client_id: "cid-1".into(),
-        access_token: "at".into(),
-        refresh_token: "rt".into(),
-        posts: Mutex::new(Vec::new()),
-        forms: Mutex::new(Vec::new()),
-    });
-    let browser = Arc::new(RecordingBrowser {
-        url: Mutex::new(None),
-        notify: Notify::new(),
-    });
     let secrets = Arc::new(MemorySecretStore::new());
-    let flow = OAuthFlow::new(http, browser, secrets);
+    let flow = OAuthFlow::new(Arc::new(HeadlessBrowser), secrets);
     let err = match flow.authorize("srv-1", "http://example.com/mcp").await {
         Err(err) => err,
         Ok(()) => panic!("expected url rejection"),
