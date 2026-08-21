@@ -1,124 +1,118 @@
-import { FormEvent, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import "./App.css";
-
-type TokenRecord = {
-  id: string;
-  client_name: string;
-  token_hash: string;
-  issued_at: number;
-  revoked_at: number | null;
-};
-
-type IssuedToken = {
-  id: string;
-  client_name: string;
-  plaintext: string;
-  issued_at: number;
-};
-
-type ServerType = "local" | "remote" | "remote-streamable";
-
-type ServerConfig = {
-  id: string;
-  name: string;
-  server_type: ServerType;
-  command: string | null;
-  args: string[];
-  env_keys: string[];
-  remote_url: string | null;
-  auto_start: boolean;
-  disabled: boolean;
-};
-
-type ServerState = {
-  config: ServerConfig;
-  status: "stopped" | "starting" | "running" | "stopping" | "error";
-  last_error: string | null;
-};
-
-type ServerTool = {
-  name: string;
-  public: boolean;
-};
-
-function parseEnv(raw: string): Record<string, string> {
-  const env: Record<string, string> = {};
-  for (const line of raw.split("\n")) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    const eq = trimmed.indexOf("=");
-    if (eq <= 0) continue;
-    env[trimmed.slice(0, eq)] = trimmed.slice(eq + 1);
-  }
-  return env;
-}
+import { Sidebar, type View } from "./components/Sidebar";
+import { ServersView } from "./components/ServersView";
+import { TokensView } from "./components/TokensView";
+import { Banner } from "./components/ui";
+import type {
+  AddServerRequest,
+  IssuedToken,
+  ServerState,
+  ServerTool,
+  TokenRecord,
+} from "./types";
 
 function App() {
+  const [view, setView] = useState<View>("servers");
   const [endpoint, setEndpoint] = useState("http://127.0.0.1:8757/mcp");
-  const [clientName, setClientName] = useState("cursor");
   const [tokens, setTokens] = useState<TokenRecord[]>([]);
   const [plaintext, setPlaintext] = useState<string | null>(null);
   const [servers, setServers] = useState<ServerState[]>([]);
-  const [toolsByServer, setToolsByServer] = useState<Record<string, ServerTool[]>>(
-    {},
-  );
+  const [toolsByServer, setToolsByServer] = useState<
+    Record<string, ServerTool[]>
+  >({});
   const [oauthByServer, setOauthByServer] = useState<Record<string, boolean>>(
     {},
   );
-  const [serverName, setServerName] = useState("");
-  const [serverType, setServerType] = useState<ServerType>("local");
-  const [command, setCommand] = useState("npx");
-  const [args, setArgs] = useState("-y @modelcontextprotocol/server-everything");
-  const [remoteUrl, setRemoteUrl] = useState("");
-  const [envText, setEnvText] = useState("");
-  const [bearer, setBearer] = useState("");
-  const [autoStart, setAutoStart] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [loaded, setLoaded] = useState(false);
+  const runningIds = useRef<Set<string>>(new Set());
 
   async function refreshTokens() {
     const listed = await invoke<TokenRecord[]>("list_tokens");
     setTokens(listed);
   }
 
-  async function refreshServers() {
-    const listed = await invoke<ServerState[]>("list_servers");
-    setServers(listed);
-    const next: Record<string, ServerTool[]> = {};
-    await Promise.all(
-      listed
-        .filter((server) => server.status === "running")
-        .map(async (server) => {
-          next[server.config.id] = await invoke<ServerTool[]>(
-            "list_server_tools",
-            { id: server.config.id },
-          );
-        }),
+  async function fetchTools(
+    running: ServerState[],
+  ): Promise<Record<string, ServerTool[]>> {
+    const entries = await Promise.all(
+      running.map(async (server) => {
+        const tools = await invoke<ServerTool[]>("list_server_tools", {
+          id: server.config.id,
+        });
+        return [server.config.id, tools] as const;
+      }),
     );
-    setToolsByServer(next);
-    const oauth: Record<string, boolean> = {};
-    await Promise.all(
+    return Object.fromEntries(entries);
+  }
+
+  async function refreshOauthFor(listed: ServerState[]) {
+    const entries = await Promise.all(
       listed
         .filter((server) => server.config.server_type !== "local")
         .map(async (server) => {
-          oauth[server.config.id] = await invoke<boolean>("oauth_connected", {
+          const connected = await invoke<boolean>("oauth_connected", {
             id: server.config.id,
           });
+          return [server.config.id, connected] as const;
         }),
     );
-    setOauthByServer(oauth);
+    setOauthByServer(Object.fromEntries(entries));
   }
+
+  const applyServerStates = useCallback((listed: ServerState[]) => {
+    setServers(listed);
+
+    // Tools change only when the set of running servers changes; fetching
+    // them on every poll would hammer the aggregator for nothing.
+    const nextRunning = new Set(
+      listed
+        .filter((server) => server.status === "running")
+        .map((server) => server.config.id),
+    );
+    const changed =
+      nextRunning.size !== runningIds.current.size ||
+      [...nextRunning].some((id) => !runningIds.current.has(id));
+    if (changed) {
+      runningIds.current = nextRunning;
+      const running = listed.filter((server) => server.status === "running");
+      fetchTools(running)
+        .then(setToolsByServer)
+        .catch((err) => setError(String(err)));
+    }
+  }, []);
+
+  const refreshServers = useCallback(async () => {
+    const listed = await invoke<ServerState[]>("list_servers");
+    applyServerStates(listed);
+  }, [applyServerStates]);
+
+  const refreshAll = useCallback(async () => {
+    const listed = await invoke<ServerState[]>("list_servers");
+    applyServerStates(listed);
+    await refreshOauthFor(listed);
+  }, [applyServerStates]);
 
   useEffect(() => {
     invoke<string>("aggregator_endpoint")
       .then(setEndpoint)
       .catch(() => {});
     refreshTokens().catch((err) => setError(String(err)));
-    refreshServers().catch((err) => setError(String(err)));
-  }, []);
+    refreshAll()
+      .catch((err) => setError(String(err)))
+      .finally(() => setLoaded(true));
 
-  async function onIssue(event: FormEvent) {
-    event.preventDefault();
+    // Statuses move on their own (starting → running/error), so poll the
+    // cheap in-memory registry; heavy tool/oauth refreshes stay on demand.
+    const poll = setInterval(() => {
+      refreshServers().catch(() => {});
+    }, 4000);
+    return () => clearInterval(poll);
+  }, [refreshAll, refreshServers]);
+
+  async function onIssue(clientName: string) {
     setError(null);
     try {
       const issued = await invoke<IssuedToken>("issue_token", {
@@ -141,29 +135,11 @@ function App() {
     }
   }
 
-  async function onAddServer(event: FormEvent) {
-    event.preventDefault();
+  async function onAddServer(request: AddServerRequest) {
     setError(null);
     try {
-      await invoke("add_server", {
-        request: {
-          name: serverName,
-          server_type: serverType,
-          command: serverType === "local" ? command : null,
-          args:
-            serverType === "local"
-              ? args.split(/\s+/).filter(Boolean)
-              : [],
-          env: parseEnv(envText),
-          remote_url: serverType === "local" ? null : remoteUrl,
-          auto_start: autoStart,
-          bearer: bearer || null,
-        },
-      });
-      setServerName("");
-      setEnvText("");
-      setBearer("");
-      await refreshServers();
+      await invoke("add_server", { request });
+      await refreshAll();
     } catch (err) {
       setError(String(err));
     }
@@ -193,7 +169,7 @@ function App() {
     setError(null);
     try {
       await invoke("delete_server", { id });
-      await refreshServers();
+      await refreshAll();
     } catch (err) {
       setError(String(err));
     }
@@ -202,12 +178,12 @@ function App() {
   async function onToggleTool(id: string, toolName: string, isPublic: boolean) {
     setError(null);
     try {
-      await invoke("set_tool_permission", {
-        id,
-        toolName,
-        public: isPublic,
-      });
-      await refreshServers();
+      await invoke("set_tool_permission", { id, toolName, isPublic });
+      const server = servers.find((s) => s.config.id === id);
+      if (server?.status === "running") {
+        const tools = await fetchTools([server]);
+        setToolsByServer((prev) => ({ ...prev, ...tools }));
+      }
     } catch (err) {
       setError(String(err));
     }
@@ -217,179 +193,47 @@ function App() {
     setError(null);
     try {
       await invoke("oauth_connect", { id });
-      await refreshServers();
+      await refreshAll();
     } catch (err) {
       setError(String(err));
     }
   }
 
-  async function copyEndpoint() {
-    await navigator.clipboard.writeText(endpoint);
-  }
-
   return (
-    <main className="container">
-      <h1>MCP Manager</h1>
-      <p>Aggregated MCP endpoint (Streamable HTTP):</p>
-      <p>
-        <code>{endpoint}</code>
-        <button type="button" onClick={copyEndpoint}>
-          Copy
-        </button>
-      </p>
-      <p className="hint">Closing this window hides the app to the menu bar.</p>
-
-      <h2>Servers</h2>
-      <form className="stack" onSubmit={onAddServer}>
-        <div className="row">
-          <input
-            value={serverName}
-            onChange={(e) => setServerName(e.currentTarget.value)}
-            placeholder="server name"
+    <div className="app">
+      <Sidebar
+        view={view}
+        onViewChange={setView}
+        serverCount={servers.length}
+        tokenCount={tokens.length}
+        endpoint={endpoint}
+      />
+      <main className="content">
+        {error && <Banner message={error} onDismiss={() => setError(null)} />}
+        {view === "servers" ? (
+          <ServersView
+            servers={servers}
+            toolsByServer={toolsByServer}
+            oauthByServer={oauthByServer}
+            loaded={loaded}
+            onAdd={onAddServer}
+            onStart={onStart}
+            onStop={onStop}
+            onDelete={onDelete}
+            onToggleTool={onToggleTool}
+            onOauth={onOauth}
           />
-          <select
-            value={serverType}
-            onChange={(e) => setServerType(e.currentTarget.value as ServerType)}
-          >
-            <option value="local">local stdio</option>
-            <option value="remote">remote SSE</option>
-            <option value="remote-streamable">remote Streamable HTTP</option>
-          </select>
-        </div>
-        {serverType === "local" ? (
-          <div className="row">
-            <input
-              value={command}
-              onChange={(e) => setCommand(e.currentTarget.value)}
-              placeholder="command"
-            />
-            <input
-              value={args}
-              onChange={(e) => setArgs(e.currentTarget.value)}
-              placeholder="args"
-            />
-          </div>
         ) : (
-          <input
-            value={remoteUrl}
-            onChange={(e) => setRemoteUrl(e.currentTarget.value)}
-            placeholder="https://example.com/mcp"
+          <TokensView
+            tokens={tokens}
+            plaintext={plaintext}
+            onIssue={onIssue}
+            onRevoke={onRevoke}
+            onDismissPlaintext={() => setPlaintext(null)}
           />
         )}
-        <textarea
-          value={envText}
-          onChange={(e) => setEnvText(e.currentTarget.value)}
-          placeholder={"ENV_NAME=value (one per line)"}
-          rows={3}
-        />
-        {serverType !== "local" && (
-          <input
-            value={bearer}
-            onChange={(e) => setBearer(e.currentTarget.value)}
-            placeholder="optional bearer token (stored in keychain)"
-          />
-        )}
-        <label className="hint">
-          <input
-            type="checkbox"
-            checked={autoStart}
-            onChange={(e) => setAutoStart(e.currentTarget.checked)}
-          />{" "}
-          auto-start
-        </label>
-        <button type="submit">Add server</button>
-      </form>
-      <ul>
-        {servers.map((server) => (
-          <li key={server.config.id}>
-            <strong>{server.config.name}</strong>{" "}
-            <span className="hint">
-              {server.config.server_type} · {server.status}
-            </span>
-            {server.last_error && (
-              <span className="hint"> · {server.last_error}</span>
-            )}
-            <div className="row">
-              {server.status === "running" ? (
-                <button type="button" onClick={() => onStop(server.config.id)}>
-                  Stop
-                </button>
-              ) : (
-                <button type="button" onClick={() => onStart(server.config.id)}>
-                  Start
-                </button>
-              )}
-              <button type="button" onClick={() => onDelete(server.config.id)}>
-                Delete
-              </button>
-              {server.config.server_type !== "local" && (
-                <button type="button" onClick={() => onOauth(server.config.id)}>
-                  {oauthByServer[server.config.id] ? "Re-auth" : "OAuth"}
-                </button>
-              )}
-            </div>
-            {server.status === "running" && (
-              <ul>
-                {(toolsByServer[server.config.id] ?? []).map((tool) => (
-                  <li key={tool.name}>
-                    <label className="hint">
-                      <input
-                        type="checkbox"
-                        checked={tool.public}
-                        onChange={(e) =>
-                          onToggleTool(
-                            server.config.id,
-                            tool.name,
-                            e.currentTarget.checked,
-                          )
-                        }
-                      />{" "}
-                      {tool.name} {tool.public ? "public" : "hidden"}
-                    </label>
-                  </li>
-                ))}
-              </ul>
-            )}
-          </li>
-        ))}
-      </ul>
-      <p className="hint">
-        Local stdio, remote Streamable HTTP, and legacy SSE servers start from
-        this list. Env values and bearer tokens stay in the keychain.
-      </p>
-
-      <h2>Client tokens</h2>
-      <form className="row" onSubmit={onIssue}>
-        <input
-          value={clientName}
-          onChange={(e) => setClientName(e.currentTarget.value)}
-          placeholder="client name"
-        />
-        <button type="submit">Issue</button>
-      </form>
-      {plaintext && (
-        <p>
-          Copy this secret now; it will not be shown again:
-          <br />
-          <code>{plaintext}</code>
-        </p>
-      )}
-      {error && <p className="hint">{error}</p>}
-      <ul>
-        {tokens.map((token) => (
-          <li key={token.id}>
-            {token.client_name}{" "}
-            {token.revoked_at ? (
-              <span className="hint">revoked</span>
-            ) : (
-              <button type="button" onClick={() => onRevoke(token.id)}>
-                Revoke
-              </button>
-            )}
-          </li>
-        ))}
-      </ul>
-    </main>
+      </main>
+    </div>
   );
 }
 
