@@ -4,7 +4,7 @@ members = [
     "crates/mcp-http",
     "crates/mcp-platform",
     "crates/mcp-runtime",
-    "apps/desktop/src-tauri",
+    "apps/desktop",
 ]
 resolver = "2"
 
