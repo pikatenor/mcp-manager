@@ -1,0 +1,83 @@
+//! View layer for the desktop shell: design tokens, style closures, and panes.
+
+pub(crate) mod servers;
+pub(crate) mod styles;
+pub(crate) mod theme;
+pub(crate) mod tokens;
+
+use iced::widget::{button, container, row, text};
+use iced::{Alignment, Font, Length};
+
+use crate::app::Message;
+
+use styles::CARD_PADDING;
+
+/// Semibold system font for titles and emphasized labels.
+pub(crate) const SEMIBOLD: Font = Font {
+    weight: iced::font::Weight::Semibold,
+    ..Font::DEFAULT
+};
+
+/// Secondary-size, secondary-color text for hints and metadata.
+pub(crate) fn secondary(label: &str) -> text::Text<'_> {
+    text(label).size(13).style(|theme| text::Style {
+        color: Some(theme::of(theme).text_secondary),
+    })
+}
+
+/// Pane title with a count chip, e.g. "Servers  3".
+pub(crate) fn pane_heading(label: &str, count: usize) -> row::Row<'_, Message> {
+    let chip = container(
+        text(count.to_string()).size(12).style(|theme| text::Style {
+            color: Some(theme::of(theme).text_secondary),
+        }),
+    )
+    .padding([2, 8])
+    .style(styles::chip);
+
+    row![text(label).size(22).font(SEMIBOLD), chip]
+        .spacing(10)
+        .align_y(Alignment::Center)
+}
+
+/// Sidebar navigation entry; the active section gets an accent tint.
+pub(crate) fn nav_item<'a>(
+    selected: bool,
+    label: &'a str,
+    message: Message,
+) -> button::Button<'a, Message> {
+    button(
+        container(
+            text(label)
+                .size(13)
+                .font(if selected { SEMIBOLD } else { Font::DEFAULT }),
+        )
+        .padding([8, 10]),
+    )
+    .width(Length::Fill)
+    .style(styles::nav(selected))
+    .on_press(message)
+}
+
+/// Accent-filled button for the one primary action of a pane.
+pub(crate) fn primary_button<'a, M: Clone>(label: &'a str) -> button::Button<'a, M> {
+    button(text(label).size(13))
+        .padding([8, 14])
+        .style(styles::primary)
+}
+
+/// Quiet bordered button for routine actions (Copy, Start, Stop, ...).
+pub(crate) fn secondary_button<'a, M: Clone>(label: &'a str) -> button::Button<'a, M> {
+    button(text(label).size(13)).padding([8, 14]).style(styles::secondary)
+}
+
+/// Full-width danger banner for the latest failed operation.
+pub(crate) fn error_banner(error: &str) -> container::Container<'_, Message> {
+    container(
+        text(format!("\u{26A0} {error}")).size(13).style(|theme| text::Style {
+            color: Some(theme::of(theme).danger),
+        }),
+    )
+    .padding(CARD_PADDING)
+    .style(styles::banner_danger)
+}
