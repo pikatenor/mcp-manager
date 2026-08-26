@@ -15,8 +15,8 @@ This file is the working contract for agents in this repo. Product overview and 
 | `mcp-core`     | Models, aggregator, SQLite (no secret *values*), URL SSRF checks, SSE endpoint parse | `target_os`, keychain, browser, reqwest |
 | `mcp-http`     | Axum router, Bearer auth, JSON-RPC `initialize` / `tools/list` / `tools/call`        | Spawning upstream servers               |
 | `mcp-platform` | `SecretStore`, `AppPaths`, `BrowserOpener`                                           | Aggregator logic                        |
-| `mcp-runtime`  | `McpConnector` (stdio / Streamable HTTP / SSE), `OAuthFlow`                          | Tauri commands                          |
-| `apps/desktop` | Tauri commands, tray, React UI                                                       | Business rules that belong in crates    |
+| `mcp-runtime`  | `McpConnector` (stdio / Streamable HTTP / SSE), `OAuthFlow`                          | Desktop UI                              |
+| `apps/desktop` | iced daemon, tray-icon, window                                                       | Business rules that belong in crates    |
 
 
 Public tool names are `{serverName}__{toolName}` (`TOOL_DELIMITER`). Missing/`true` in `tool_permissions` is public; `false` hides and blocks.
@@ -33,9 +33,9 @@ Default workflow for crates:
 2. Run tests; confirm they fail for the right reason.
 3. Implement until tests pass. **Do not change those tests** while implementing.
 4. Commit the implementation and tests (short why-focused message).
-5. `cargo clippy --all-targets -- -D warnings` on touched crates. Frontend: `tsc --noEmit` in `apps/desktop`.
+5. `cargo clippy --all-targets -- -D warnings` on touched crates.
 
-UI/Tauri wiring is often a thin shell over crate APIs; still keep crate logic test-first.
+UI wiring is a thin shell over crate APIs; still keep crate logic test-first.
 
 ## Git
 
@@ -52,11 +52,10 @@ cargo test -p mcp-core --lib
 cargo test -p mcp-http
 cargo test -p mcp-runtime
 cargo clippy --all-targets -- -D warnings
-pnpm -C apps/desktop exec tsc --noEmit
-pnpm tauri dev
+cargo run -p mcp-manager
 ```
 
-Use asdf for Node when a local version is set. Lint for this repo is **clippy**, not golangci-lint.
+Lint for this repo is **clippy**, not golangci-lint.
 
 ## Do not
 

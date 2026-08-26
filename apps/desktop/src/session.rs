@@ -1,23 +1,25 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_core::{
-    BackendConnector, IssuedToken, ServerConfig, ServerRegistry, ServerState, ServerType,
-    TokenRecord, TokenService,
+    is_tool_public, Aggregator, BackendConnector, IssuedToken, ServerConfig, ServerRegistry,
+    ServerState, ServerType, TokenRecord, TokenService,
 };
-use mcp_platform::{BrowserOpener, SecretStore};
+use mcp_platform::{
+    server_bearer_key, server_env_key, server_oauth_key, BrowserOpener, SecretStore,
+    SecretStoreError,
+};
+use mcp_runtime::OAuthFlow;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Clone)]
 pub struct Session {
-    #[allow(dead_code)]
     tokens: Arc<Mutex<TokenService>>,
-    #[allow(dead_code)]
     registry: Arc<AsyncMutex<ServerRegistry>>,
-    #[allow(dead_code)]
+    aggregator: Arc<AsyncMutex<Aggregator>>,
     secrets: Arc<dyn SecretStore>,
-    #[allow(dead_code)]
     browser: Arc<dyn BrowserOpener>,
 }
 
@@ -39,8 +41,72 @@ pub struct ServerToolView {
     pub public: bool,
 }
 
-pub fn parse_env(_raw: &str) -> HashMap<String, String> {
-    unimplemented!("parse_env")
+pub fn parse_env(raw: &str) -> HashMap<String, String> {
+    let mut env = HashMap::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(eq) = trimmed.find('=') else {
+            continue;
+        };
+        if eq == 0 {
+            continue;
+        }
+        env.insert(trimmed[..eq].to_string(), trimmed[eq + 1..].to_string());
+    }
+    env
+}
+
+fn new_server_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("srv-{nanos:x}")
+}
+
+fn load_secrets(
+    store: &dyn SecretStore,
+    config: &ServerConfig,
+) -> Result<HashMap<String, String>, SecretStoreError> {
+    let mut secrets = HashMap::new();
+    for key in &config.env_keys {
+        if let Some(value) = store.get(&server_env_key(&config.id, key))? {
+            secrets.insert(key.clone(), value);
+        }
+    }
+    if let Some(bearer) = store.get(&server_bearer_key(&config.id))? {
+        secrets.insert("BEARER_TOKEN".into(), bearer);
+    }
+    Ok(secrets)
+}
+
+fn persist_secrets(
+    store: &dyn SecretStore,
+    id: &str,
+    env: &HashMap<String, String>,
+    bearer: Option<&str>,
+) -> Result<(), SecretStoreError> {
+    for (key, value) in env {
+        store.set(&server_env_key(id, key), value)?;
+    }
+    if let Some(token) = bearer.filter(|value| !value.is_empty()) {
+        store.set(&server_bearer_key(id), token)?;
+    }
+    Ok(())
+}
+
+fn delete_secrets(store: &dyn SecretStore, config: &ServerConfig) {
+    for key in &config.env_keys {
+        let _ = store.delete(&server_env_key(&config.id, key));
+    }
+    let _ = store.delete(&server_bearer_key(&config.id));
+    let _ = store.delete(&server_oauth_key(&config.id, "access_token"));
+    let _ = store.delete(&server_oauth_key(&config.id, "refresh_token"));
+    let _ = store.delete(&server_oauth_key(&config.id, "client_id"));
+    let _ = store.delete(&server_oauth_key(&config.id, "credentials"));
 }
 
 impl Session {
@@ -55,59 +121,158 @@ impl Session {
             TokenService::open_sqlite(&data_dir.join("tokens.db")).map_err(|e| e.to_string())?;
         let registry = ServerRegistry::open_sqlite(&data_dir.join("state.db"), connector)
             .map_err(|e| e.to_string())?;
+        let aggregator = registry.aggregator();
         Ok(Self {
             tokens: Arc::new(Mutex::new(tokens)),
             registry: Arc::new(AsyncMutex::new(registry)),
+            aggregator,
             secrets,
             browser,
         })
     }
 
+    pub fn tokens(&self) -> Arc<Mutex<TokenService>> {
+        self.tokens.clone()
+    }
+
+    pub fn aggregator(&self) -> Arc<AsyncMutex<Aggregator>> {
+        self.aggregator.clone()
+    }
+
     pub fn aggregator_endpoint() -> String {
-        unimplemented!("aggregator_endpoint")
+        format!(
+            "http://{}{}",
+            mcp_core::DEFAULT_HTTP_BIND,
+            mcp_core::DEFAULT_MCP_PATH
+        )
     }
 
     pub fn issue_token(&self, client_name: &str) -> Result<IssuedToken, String> {
-        let _ = client_name;
-        unimplemented!("issue_token")
+        let name = client_name.trim();
+        if name.is_empty() {
+            return Err("client name is required".into());
+        }
+        self.tokens
+            .lock()
+            .map_err(|e| e.to_string())
+            .map(|mut svc| svc.issue(name))
     }
 
     pub fn list_tokens(&self) -> Result<Vec<TokenRecord>, String> {
-        unimplemented!("list_tokens")
+        self.tokens
+            .lock()
+            .map_err(|e| e.to_string())
+            .map(|svc| svc.list())
     }
 
     pub fn revoke_token(&self, id: &str) -> Result<(), String> {
-        let _ = id;
-        unimplemented!("revoke_token")
+        self.tokens
+            .lock()
+            .map_err(|e| e.to_string())?
+            .revoke(id)
+            .map_err(|e| e.to_string())
     }
 
     pub async fn list_servers(&self) -> Result<Vec<ServerState>, String> {
-        unimplemented!("list_servers")
+        self.registry.lock().await.list().map_err(|e| e.to_string())
     }
 
     pub async fn add_server(&self, request: AddServerRequest) -> Result<ServerConfig, String> {
-        let _ = request;
-        unimplemented!("add_server")
+        let name = request.name.trim();
+        if name.is_empty() {
+            return Err("server name is required".into());
+        }
+        let id = new_server_id();
+        let env_keys: Vec<String> = request.env.keys().cloned().collect();
+        persist_secrets(
+            self.secrets.as_ref(),
+            &id,
+            &request.env,
+            request.bearer.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+        let config = ServerConfig {
+            id,
+            name: name.to_string(),
+            server_type: request.server_type,
+            command: request.command.filter(|c| !c.trim().is_empty()),
+            args: request.args,
+            env_keys,
+            remote_url: request.remote_url.filter(|u| !u.trim().is_empty()),
+            auto_start: request.auto_start,
+            disabled: false,
+            tool_permissions: HashMap::new(),
+        };
+        self.registry
+            .lock()
+            .await
+            .add(config)
+            .map_err(|e| e.to_string())
     }
 
     pub async fn delete_server(&self, id: &str) -> Result<bool, String> {
-        let _ = id;
-        unimplemented!("delete_server")
+        let mut registry = self.registry.lock().await;
+        let config = registry
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .map(|state| state.config);
+        if let Some(config) = config {
+            delete_secrets(self.secrets.as_ref(), &config);
+        }
+        registry.delete(id).await.map_err(|e| e.to_string())
     }
 
     pub async fn start_server(&self, id: &str) -> Result<(), String> {
-        let _ = id;
-        unimplemented!("start_server")
+        let mut registry = self.registry.lock().await;
+        let config = registry
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .ok_or_else(|| format!("unknown server: {id}"))?
+            .config;
+        let server_secrets =
+            load_secrets(self.secrets.as_ref(), &config).map_err(|e| e.to_string())?;
+        registry
+            .start(id, server_secrets)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn stop_server(&self, id: &str) -> Result<(), String> {
-        let _ = id;
-        unimplemented!("stop_server")
+        self.registry
+            .lock()
+            .await
+            .stop(id)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub async fn list_server_tools(&self, id: &str) -> Result<Vec<ServerToolView>, String> {
-        let _ = id;
-        unimplemented!("list_server_tools")
+        let registry = self.registry.lock().await;
+        let config = registry
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .ok_or_else(|| format!("unknown server: {id}"))?
+            .config;
+        let tools = registry
+            .aggregator()
+            .lock()
+            .await
+            .origin_tools(id)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(tools
+            .into_iter()
+            .map(|tool| ServerToolView {
+                public: is_tool_public(&config.tool_permissions, &tool.name),
+                name: tool.name,
+            })
+            .collect())
     }
 
     pub async fn set_tool_permission(
@@ -116,21 +281,71 @@ impl Session {
         tool_name: &str,
         public: bool,
     ) -> Result<(), String> {
-        let _ = (id, tool_name, public);
-        unimplemented!("set_tool_permission")
+        let mut registry = self.registry.lock().await;
+        let mut config = registry
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .ok_or_else(|| format!("unknown server: {id}"))?
+            .config;
+        config
+            .tool_permissions
+            .insert(tool_name.to_string(), public);
+        registry.update(config).map_err(|e| e.to_string())?;
+        Ok(())
     }
 
     pub async fn oauth_connect(&self, id: &str) -> Result<(), String> {
-        let _ = id;
-        unimplemented!("oauth_connect")
+        let remote_url = {
+            let registry = self.registry.lock().await;
+            let state = registry
+                .list()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|state| state.config.id == id)
+                .ok_or_else(|| format!("unknown server: {id}"))?;
+            if state.config.server_type == ServerType::Local {
+                return Err("OAuth is only for remote servers".into());
+            }
+            state
+                .config
+                .remote_url
+                .ok_or_else(|| "remote_url is required".to_string())?
+        };
+        let flow = OAuthFlow::new(self.browser.clone(), self.secrets.clone());
+        flow.authorize(id, &remote_url)
+            .await
+            .map_err(|e| e.to_string())
     }
 
     pub fn oauth_connected(&self, id: &str) -> Result<bool, String> {
-        let _ = id;
-        unimplemented!("oauth_connected")
+        Ok(self
+            .secrets
+            .get(&server_oauth_key(id, "access_token"))
+            .map_err(|e| e.to_string())?
+            .filter(|value| !value.is_empty())
+            .is_some())
     }
 
     pub async fn auto_start(&self) -> Result<(), String> {
-        unimplemented!("auto_start")
+        let mut registry = self.registry.lock().await;
+        let mut all_secrets = HashMap::new();
+        if let Ok(listed) = registry.list() {
+            for state in listed {
+                match load_secrets(self.secrets.as_ref(), &state.config) {
+                    Ok(server_secrets) => {
+                        all_secrets.insert(state.config.id.clone(), server_secrets);
+                    }
+                    Err(error) => {
+                        eprintln!("secret load failed for {}: {error}", state.config.id);
+                    }
+                }
+            }
+        }
+        registry
+            .auto_start(all_secrets)
+            .await
+            .map_err(|e| e.to_string())
     }
 }

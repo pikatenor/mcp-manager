@@ -1,4 +1,6 @@
-use mcp_manager::shell::{on_close_requested, on_tray, parse_tray_menu_id, ShellAction, TrayCommand};
+use mcp_manager::shell::{
+    on_close_requested, on_tray, parse_tray_menu_id, ShellAction, TrayCommand,
+};
 
 #[test]
 fn tray_menu_ids_match_product_labels() {
