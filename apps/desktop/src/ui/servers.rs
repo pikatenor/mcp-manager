@@ -1,27 +1,45 @@
 //! Servers pane: add-server form and the configured server list.
 
-use iced::widget::{button, checkbox, column, pick_list, row, text, text_editor, text_input};
-use iced::{Element, Length};
+use iced::widget::{
+    checkbox, column, container, pick_list, row, space, text, text_editor, text_input,
+};
+use iced::{Alignment, Element, Length};
 
 use mcp_core::{ServerStatus, ServerType};
 
 use crate::app::{App, FormServerType, Message, FORM_SERVER_TYPES};
 
 use super::theme::{of, status_color, status_label, type_label};
-use super::{pane_heading, secondary};
+use super::{
+    card, danger_button, form_label, pane_heading, primary_button, secondary, secondary_button,
+    status_dot, SEMIBOLD,
+};
 
 pub(crate) fn view(app: &App) -> Element<'_, Message> {
     let mut body = column![pane_heading("Servers", app.servers.len())].spacing(16);
 
     if app.show_add_form {
-        body = body.push(add_form(app));
+        body = body.push(card(add_form(app)));
+    }
+
+    if app.servers.is_empty() && !app.show_add_form {
+        body = body.push(card(
+            container(secondary(
+                "No servers yet. Add your first MCP server with “+ Add server”.",
+            ))
+            .width(Length::Fill)
+            .align_x(iced::alignment::Horizontal::Center),
+        ));
     }
 
     for server in &app.servers {
         let id = server.config.id.clone();
         let status = server.status;
-        let mut card = column![row![
-            text(&server.config.name).size(16),
+
+        let mut content = column![row![
+            status_dot(status),
+            text(&server.config.name).size(16).font(SEMIBOLD),
+            space::horizontal(),
             text(type_label(server.config.server_type))
                 .size(13)
                 .style(|theme| text::Style {
@@ -31,55 +49,62 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
                 color: Some(status_color(of(theme), status)),
             }),
         ]
-        .spacing(8)];
+        .spacing(8)
+        .align_y(Alignment::Center)]
+        .spacing(10);
+
         if let Some(error) = &server.last_error {
-            card = card.push(text(error).size(13).style(|theme| text::Style {
-                color: Some(of(theme).text_secondary),
+            content = content.push(text(error).size(13).style(|theme| text::Style {
+                color: Some(of(theme).danger),
             }));
         }
+
         let mut actions = row![].spacing(8);
         if server.status == ServerStatus::Running {
-            actions = actions.push(button("Stop").on_press(Message::Stop(id.clone())));
+            actions =
+                actions.push(secondary_button("Stop").on_press(Message::Stop(id.clone())));
         } else {
-            actions = actions.push(button("Start").on_press(Message::Start(id.clone())));
+            actions =
+                actions.push(secondary_button("Start").on_press(Message::Start(id.clone())));
         }
-        actions = actions.push(button("Delete").on_press(Message::Delete(id.clone())));
         if server.config.server_type != ServerType::Local {
-            let label = if app
-                .oauth_by_server
-                .get(&id)
-                .copied()
-                .unwrap_or(false)
-            {
+            let label = if app.oauth_by_server.get(&id).copied().unwrap_or(false) {
                 "Re-auth"
             } else {
                 "OAuth"
             };
-            actions = actions.push(button(label).on_press(Message::Oauth(id.clone())));
+            actions = actions.push(secondary_button(label).on_press(Message::Oauth(id.clone())));
         }
-        card = card.push(actions);
+        actions = actions.push(danger_button("Delete").on_press(Message::Delete(id.clone())));
+        content = content.push(actions);
+
         if server.status == ServerStatus::Running {
             if let Some(tools) = app.tools_by_server.get(&id) {
+                let mut tool_list = column![].spacing(6);
                 for tool in tools {
                     let tool_id = id.clone();
                     let tool_name = tool.name.clone();
-                    card = card.push(
-                        checkbox(tool.public)
-                            .label(format!(
-                                "{} {}",
-                                tool.name,
-                                if tool.public { "public" } else { "hidden" }
-                            ))
-                            .on_toggle(move |public| Message::ToggleTool {
-                                id: tool_id.clone(),
-                                name: tool_name.clone(),
-                                public,
-                            }),
+                    tool_list = tool_list.push(
+                        row![
+                            checkbox(tool.public)
+                                .label(tool.name.clone())
+                                .on_toggle(move |public| Message::ToggleTool {
+                                    id: tool_id.clone(),
+                                    name: tool_name.clone(),
+                                    public,
+                                }),
+                            space::horizontal(),
+                            secondary(if tool.public { "public" } else { "hidden" }),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
                     );
                 }
+                content = content.push(tool_list);
             }
         }
-        body = body.push(card.spacing(6));
+
+        body = body.push(card(content));
     }
 
     body.push(secondary(
@@ -89,44 +114,59 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
-    let mut form = column![row![
-        text_input("server name", &app.server_name).on_input(Message::ServerName),
-        pick_list(
-            FORM_SERVER_TYPES,
-            Some(app.server_type),
-            Message::ServerType,
-        ),
-    ]
-    .spacing(8)]
-    .spacing(8);
+    let mut form = column![text("Add server").size(15).font(SEMIBOLD)].spacing(12);
+
+    form = form.push(field("Name", {
+        let mut inputs = row![text_input("server name", &app.server_name)
+            .on_input(Message::ServerName)
+            .width(Length::Fill)]
+        .spacing(8);
+        inputs = inputs.push(
+            pick_list(
+                FORM_SERVER_TYPES,
+                Some(app.server_type),
+                Message::ServerType,
+            )
+            .width(Length::FillPortion(2)),
+        );
+        inputs
+    }));
 
     if app.server_type == FormServerType::Local {
-        form = form.push(
+        form = form.push(field(
+            "Command",
             row![
-                text_input("command", &app.command).on_input(Message::Command),
-                text_input("args", &app.args).on_input(Message::Args),
+                text_input("command", &app.command)
+                    .on_input(Message::Command)
+                    .width(Length::FillPortion(1)),
+                text_input("args", &app.args)
+                    .on_input(Message::Args)
+                    .width(Length::FillPortion(2)),
             ]
             .spacing(8),
-        );
+        ));
     } else {
-        form = form.push(
+        form = form.push(field(
+            "URL",
             text_input("https://example.com/mcp", &app.remote_url)
                 .on_input(Message::RemoteUrl),
-        );
+        ));
     }
 
-    form = form.push(
+    form = form.push(field(
+        "Environment",
         text_editor(&app.env)
             .placeholder("ENV_NAME=value (one per line)")
             .height(Length::Fixed(72.0))
             .on_action(Message::Env),
-    );
+    ));
 
     if app.server_type != FormServerType::Local {
-        form = form.push(
+        form = form.push(field(
+            "Bearer",
             text_input("optional bearer token (stored in keychain)", &app.bearer)
                 .on_input(Message::Bearer),
-        );
+        ));
     }
 
     form = form.push(
@@ -134,9 +174,20 @@ fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
             .label("auto-start")
             .on_toggle(Message::AutoStart),
     );
-    form.push(row![
-        button("Add server").on_press(Message::AddServer),
-        button("Cancel").on_press(Message::CancelAddForm),
-    ]
-    .spacing(8))
+
+    form.push(
+        row![
+            primary_button("Add server").on_press(Message::AddServer),
+            secondary_button("Cancel").on_press(Message::CancelAddForm),
+        ]
+        .spacing(8),
+    )
+}
+
+/// A labeled form field: small semibold label above the input row.
+fn field<'a>(
+    label: &'a str,
+    input: impl Into<iced::Element<'a, Message>>,
+) -> iced::widget::Column<'a, Message> {
+    column![form_label(label), input.into()].spacing(4)
 }
