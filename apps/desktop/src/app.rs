@@ -1,16 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, text, text_editor, text_input,
-};
-use iced::{clipboard, window, Element, Length, Size, Subscription, Task};
+use iced::widget::{column, container, row, scrollable, space, text, text_editor};
+use iced::{clipboard, window, Alignment, Element, Font, Length, Size, Subscription, Task};
 use mcp_core::{IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord};
 use mcp_platform::{AppPaths, NativeAppPaths, NativeBrowserOpener, SecretStore};
 use mcp_runtime::McpConnector;
 
 use crate::session::{parse_env, AddServerRequest, ServerToolView, Session};
 use crate::shell::{on_close_requested, ShellAction};
+use crate::ui;
 #[cfg(target_os = "macos")]
 use crate::shell::{on_tray, parse_tray_menu_id};
 
@@ -49,7 +48,14 @@ pub(crate) enum FormServerType {
     RemoteStreamable,
 }
 
-const FORM_SERVER_TYPES: [FormServerType; 3] = [
+/// Content section shown in the main pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Section {
+    Servers,
+    Tokens,
+}
+
+pub(crate) const FORM_SERVER_TYPES: [FormServerType; 3] = [
     FormServerType::Local,
     FormServerType::Remote,
     FormServerType::RemoteStreamable,
@@ -75,25 +81,27 @@ impl From<FormServerType> for ServerType {
     }
 }
 
-struct App {
+pub(crate) struct App {
     session: Session,
     window_id: Option<window::Id>,
-    endpoint: String,
-    client_name: String,
-    tokens: Vec<TokenRecord>,
-    plaintext: Option<String>,
-    servers: Vec<ServerState>,
-    tools_by_server: HashMap<String, Vec<ServerToolView>>,
-    oauth_by_server: HashMap<String, bool>,
-    server_name: String,
-    server_type: FormServerType,
-    command: String,
-    args: String,
-    remote_url: String,
-    env: text_editor::Content,
-    bearer: String,
-    auto_start: bool,
-    error: Option<String>,
+    pub(crate) endpoint: String,
+    pub(crate) section: Section,
+    pub(crate) show_add_form: bool,
+    pub(crate) client_name: String,
+    pub(crate) tokens: Vec<TokenRecord>,
+    pub(crate) plaintext: Option<String>,
+    pub(crate) servers: Vec<ServerState>,
+    pub(crate) tools_by_server: HashMap<String, Vec<ServerToolView>>,
+    pub(crate) oauth_by_server: HashMap<String, bool>,
+    pub(crate) server_name: String,
+    pub(crate) server_type: FormServerType,
+    pub(crate) command: String,
+    pub(crate) args: String,
+    pub(crate) remote_url: String,
+    pub(crate) env: text_editor::Content,
+    pub(crate) bearer: String,
+    pub(crate) auto_start: bool,
+    pub(crate) error: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +112,9 @@ pub enum Message {
     TrayTick,
     CopyEndpoint,
     CopyPlaintext,
+    Navigate(Section),
+    ToggleAddForm,
+    CancelAddForm,
     ClientName(String),
     IssueToken,
     TokenIssued(Result<IssuedToken, String>),
@@ -177,24 +188,6 @@ async fn load_snapshot(session: Session) -> Result<Snapshot, String> {
     })
 }
 
-fn status_label(status: ServerStatus) -> &'static str {
-    match status {
-        ServerStatus::Stopped => "stopped",
-        ServerStatus::Starting => "starting",
-        ServerStatus::Running => "running",
-        ServerStatus::Stopping => "stopping",
-        ServerStatus::Error => "error",
-    }
-}
-
-fn type_label(server_type: ServerType) -> &'static str {
-    match server_type {
-        ServerType::Local => "local",
-        ServerType::Remote => "remote",
-        ServerType::RemoteStreamable => "remote-streamable",
-    }
-}
-
 impl App {
     fn boot() -> (Self, Task<Message>) {
         let data_dir = NativeAppPaths.data_dir();
@@ -216,6 +209,8 @@ impl App {
             endpoint: Session::aggregator_endpoint(),
             session: session.clone(),
             window_id: None,
+            section: Section::Servers,
+            show_add_form: false,
             client_name: String::from("cursor"),
             tokens: Vec::new(),
             plaintext: None,
@@ -288,6 +283,12 @@ impl App {
         }
     }
 
+    fn clear_form(&mut self) {
+        self.server_name.clear();
+        self.env = text_editor::Content::new();
+        self.bearer.clear();
+    }
+
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::WindowOpened(id) => {
@@ -312,6 +313,19 @@ impl App {
                 .clone()
                 .map(clipboard::write)
                 .unwrap_or_else(Task::none),
+            Message::Navigate(section) => {
+                self.section = section;
+                Task::none()
+            }
+            Message::ToggleAddForm => {
+                self.show_add_form = !self.show_add_form;
+                Task::none()
+            }
+            Message::CancelAddForm => {
+                self.clear_form();
+                self.show_add_form = false;
+                Task::none()
+            }
             Message::ClientName(value) => {
                 self.client_name = value;
                 Task::none()
@@ -463,9 +477,8 @@ impl App {
                 }
             }
             Message::SnapshotReadyClearForm => {
-                self.server_name.clear();
-                self.env = text_editor::Content::new();
-                self.bearer.clear();
+                self.clear_form();
+                self.show_add_form = false;
                 self.error = None;
                 self.refresh()
             }
@@ -485,158 +498,86 @@ impl App {
     }
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
-        let hint = iced::Color::from_rgb(0.4, 0.4, 0.4);
-        let mut body = column![
-            text("MCP Manager").size(28),
-            text("Aggregated MCP endpoint (Streamable HTTP):"),
+        let top_bar = container(
             row![
-                text(&self.endpoint),
-                button("Copy").on_press(Message::CopyEndpoint),
+                text("MCP Manager").size(15).font(ui::SEMIBOLD),
+                space::horizontal(),
+                container(
+                    text(&self.endpoint).size(12).font(Font::MONOSPACE).style(
+                        |theme| text::Style {
+                            color: Some(ui::theme::of(theme).text_secondary),
+                        },
+                    ),
+                )
+                .padding([6, 10])
+                .style(ui::styles::chip),
+                ui::secondary_button("Copy").on_press(Message::CopyEndpoint),
             ]
-            .spacing(8),
-            text("Closing this window hides the app to the menu bar.").color(hint),
-            text("Servers").size(22),
-            row![
-                text_input("server name", &self.server_name).on_input(Message::ServerName),
-                pick_list(
-                    FORM_SERVER_TYPES,
-                    Some(self.server_type),
-                    Message::ServerType
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 16])
+        .width(Length::Fill)
+        .style(ui::styles::top_bar);
+
+        let mut sidebar_content = column![].spacing(12);
+        sidebar_content = sidebar_content.push(
+            column![
+                ui::nav_item(
+                    self.section == Section::Servers,
+                    "Servers",
+                    Message::Navigate(Section::Servers),
+                ),
+                ui::nav_item(
+                    self.section == Section::Tokens,
+                    "Client tokens",
+                    Message::Navigate(Section::Tokens),
                 ),
             ]
-            .spacing(8),
-        ]
-        .spacing(10);
-
-        if self.server_type == FormServerType::Local {
-            body = body.push(
-                row![
-                    text_input("command", &self.command).on_input(Message::Command),
-                    text_input("args", &self.args).on_input(Message::Args),
-                ]
-                .spacing(8),
-            );
-        } else {
-            body = body.push(
-                text_input("https://example.com/mcp", &self.remote_url)
-                    .on_input(Message::RemoteUrl),
+            .spacing(2),
+        );
+        if self.section == Section::Servers {
+            sidebar_content = sidebar_content.push(
+                ui::primary_button("+ Add server")
+                    .width(Length::Fill)
+                    .on_press(Message::ToggleAddForm),
             );
         }
+        sidebar_content = sidebar_content.push(space::vertical());
+        sidebar_content = sidebar_content.push(ui::secondary(
+            "Closing this window hides the app to the menu bar.",
+        ));
 
-        body = body.push(
-            text_editor(&self.env)
-                .placeholder("ENV_NAME=value (one per line)")
-                .height(Length::Fixed(72.0))
-                .on_action(Message::Env),
-        );
-
-        if self.server_type != FormServerType::Local {
-            body = body.push(
-                text_input("optional bearer token (stored in keychain)", &self.bearer)
-                    .on_input(Message::Bearer),
-            );
-        }
-
-        body = body.push(
-            checkbox(self.auto_start)
-                .label("auto-start")
-                .on_toggle(Message::AutoStart),
-        );
-        body = body.push(button("Add server").on_press(Message::AddServer));
-
-        for server in &self.servers {
-            let id = server.config.id.clone();
-            let mut card = column![row![
-                text(&server.config.name).size(16),
-                text(format!(
-                    "{} · {}",
-                    type_label(server.config.server_type),
-                    status_label(server.status)
-                ))
-                .color(hint),
-            ]
-            .spacing(8)];
-            if let Some(error) = &server.last_error {
-                card = card.push(text(error).color(hint));
-            }
-            let mut actions = row![].spacing(8);
-            if server.status == ServerStatus::Running {
-                actions = actions.push(button("Stop").on_press(Message::Stop(id.clone())));
-            } else {
-                actions = actions.push(button("Start").on_press(Message::Start(id.clone())));
-            }
-            actions = actions.push(button("Delete").on_press(Message::Delete(id.clone())));
-            if server.config.server_type != ServerType::Local {
-                let label = if self.oauth_by_server.get(&id).copied().unwrap_or(false) {
-                    "Re-auth"
-                } else {
-                    "OAuth"
-                };
-                actions = actions.push(button(label).on_press(Message::Oauth(id.clone())));
-            }
-            card = card.push(actions);
-            if server.status == ServerStatus::Running {
-                if let Some(tools) = self.tools_by_server.get(&id) {
-                    for tool in tools {
-                        let tool_id = id.clone();
-                        let tool_name = tool.name.clone();
-                        card = card.push(
-                            checkbox(tool.public)
-                                .label(format!(
-                                    "{} {}",
-                                    tool.name,
-                                    if tool.public { "public" } else { "hidden" }
-                                ))
-                                .on_toggle(move |public| Message::ToggleTool {
-                                    id: tool_id.clone(),
-                                    name: tool_name.clone(),
-                                    public,
-                                }),
-                        );
-                    }
-                }
-            }
-            body = body.push(card.spacing(6));
-        }
-
-        body = body.push(
-            text("Local stdio, remote Streamable HTTP, and legacy SSE servers start from this list. Env values and bearer tokens stay in the keychain.")
-                .color(hint),
-        );
-        body = body.push(text("Client tokens").size(22));
-        body = body.push(
-            row![
-                text_input("client name", &self.client_name).on_input(Message::ClientName),
-                button("Issue").on_press(Message::IssueToken),
-            ]
-            .spacing(8),
-        );
-        if let Some(plaintext) = &self.plaintext {
-            body = body.push(text("Copy this secret now; it will not be shown again:"));
-            body = body.push(
-                row![
-                    text(plaintext),
-                    button("Copy").on_press(Message::CopyPlaintext),
-                ]
-                .spacing(8),
-            );
-        }
-        if let Some(error) = &self.error {
-            body = body.push(text(error).color(hint));
-        }
-        for token in &self.tokens {
-            let mut line = row![text(&token.client_name)].spacing(8);
-            if token.revoked_at.is_some() {
-                line = line.push(text("revoked").color(hint));
-            } else {
-                line = line.push(button("Revoke").on_press(Message::Revoke(token.id.clone())));
-            }
-            body = body.push(line);
-        }
-
-        scrollable(container(body.padding(24).width(Length::Fill)).width(Length::Fill))
-            .width(Length::Fill)
+        let sidebar = container(sidebar_content.padding(12))
+            .width(Length::Fixed(216.0))
             .height(Length::Fill)
-            .into()
+            .style(ui::styles::sidebar);
+
+        let pane = match self.section {
+            Section::Servers => ui::servers::view(self),
+            Section::Tokens => ui::tokens::view(self),
+        };
+
+        let mut body = column![].spacing(16);
+        if let Some(error) = &self.error {
+            body = body.push(ui::error_banner(error));
+        }
+        let body = body
+            .push(scrollable(pane).width(Length::Fill).height(Length::Fill))
+            .height(Length::Fill);
+        let content = container(body)
+            .padding(24)
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        container(
+            column![top_bar, row![sidebar, content].height(Length::Fill)]
+                .width(Length::Fill)
+                .height(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(ui::styles::app_background)
+        .into()
     }
 }
