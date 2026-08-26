@@ -38,6 +38,20 @@ pub(crate) fn sidebar(theme: &Theme) -> container::Style {
     }
 }
 
+/// Card surface for grouped content.
+pub(crate) fn card(theme: &Theme) -> container::Style {
+    let tokens = theme::of(theme);
+    container::Style {
+        background: Some(Background::Color(tokens.surface)),
+        border: Border {
+            color: tokens.border,
+            width: 1.0,
+            radius: 10.0.into(),
+        },
+        ..container::Style::default()
+    }
+}
+
 /// Code-chip surface for monospace values (endpoint, counts).
 pub(crate) fn chip(theme: &Theme) -> container::Style {
     container::Style {
@@ -78,6 +92,12 @@ pub(crate) fn primary(theme: &Theme, status: button::Status) -> button::Style {
 pub(crate) fn secondary(theme: &Theme, status: button::Status) -> button::Style {
     let tokens = theme::of(theme);
     outlined(tokens, tokens.text, tokens.border, status)
+}
+
+/// Bordered button in the danger color for destructive actions.
+pub(crate) fn danger(theme: &Theme, status: button::Status) -> button::Style {
+    let tokens = theme::of(theme);
+    outlined(tokens, tokens.danger, tinted(tokens.danger, 0.50), status)
 }
 
 fn filled(fill: Color, hover: Color, text: Color, status: button::Status) -> button::Style {
