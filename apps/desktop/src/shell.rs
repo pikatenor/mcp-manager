@@ -15,15 +15,28 @@ pub enum ShellAction {
 }
 
 pub fn parse_tray_menu_id(id: &str) -> Option<TrayCommand> {
-    let _ = id;
-    unimplemented!("parse_tray_menu_id")
+    match id {
+        "open" => Some(TrayCommand::Open),
+        "copy-endpoint" => Some(TrayCommand::CopyEndpoint),
+        "quit" => Some(TrayCommand::Quit),
+        _ => None,
+    }
 }
 
 pub fn on_tray(window_open: bool, command: TrayCommand) -> ShellAction {
-    let _ = (window_open, command);
-    unimplemented!("on_tray")
+    match command {
+        TrayCommand::Open => {
+            if window_open {
+                ShellAction::FocusWindow
+            } else {
+                ShellAction::OpenWindow
+            }
+        }
+        TrayCommand::CopyEndpoint => ShellAction::CopyEndpoint,
+        TrayCommand::Quit => ShellAction::Exit,
+    }
 }
 
 pub fn on_close_requested() -> ShellAction {
-    unimplemented!("on_close_requested")
+    ShellAction::CloseWindow
 }

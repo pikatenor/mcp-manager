@@ -11,9 +11,16 @@ name = "mcp-manager"
 path = "src/main.rs"
 
 [dependencies]
+iced = { version = "0.14", features = ["tokio"] }
 mcp-core.workspace = true
+mcp-http.workspace = true
 mcp-platform.workspace = true
+mcp-runtime.workspace = true
 tokio.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
+tray-icon = "0.21"
 
 [dev-dependencies]
 async-trait.workspace = true

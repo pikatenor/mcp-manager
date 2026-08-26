@@ -30,7 +30,7 @@ crates/mcp-core      OS-free models, aggregator, tokens, SQLite, SSE handshake
 crates/mcp-http      inbound Axum /mcp (Bearer + JSON-RPC)
 crates/mcp-platform  SecretStore, AppPaths, BrowserOpener (macOS impl)
 crates/mcp-runtime   upstream connectors + OAuth flow
-apps/desktop         Tauri 2 + React/TS UI (bundle id net.p1kachu.mcp-manager)
+apps/desktop         iced + tray-icon UI (bundle id net.p1kachu.mcp-manager)
 ```
 
 Bundle identifier: `net.p1kachu.mcp-manager`.
@@ -39,14 +39,12 @@ On disk (app data dir): `tokens.db` (hashed client tokens), `state.db` (server c
 
 ## Development
 
-Requires Rust 1.85+, pnpm, and a macOS toolchain for the desktop app. Node version is project-local (asdf `nodejs` if you use asdf).
+Requires Rust 1.85+ and a macOS toolchain for the desktop app.
 
 ```bash
-pnpm install
 cargo test
 cargo clippy --all-targets -- -D warnings
-pnpm --filter mcp-manager exec tsc --noEmit
-pnpm tauri dev
+cargo run -p mcp-manager
 ```
 
 Crate-scoped tests:

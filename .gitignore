@@ -2,10 +2,8 @@
 /target
 **/*.rs.bk
 
-# Node
+# Local leftover from the former Node toolchain
 node_modules/
-dist/
-.vite/
 
 # OS / editor
 .DS_Store
@@ -15,10 +13,6 @@ dist/
 # Env / secrets
 .env
 .env.*
-
-# Tauri generated
-apps/desktop/src-tauri/gen/
-apps/desktop/src-tauri/target/
 
 # Local reference clone of mcp-router (not part of this repo)
 __reference/

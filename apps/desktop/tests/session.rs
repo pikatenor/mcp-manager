@@ -6,12 +6,10 @@ use mcp_core::{
     AggregatorError, BackendConnector, McpBackend, RegistryError, ServerConfig, ServerStatus,
     ServerType, Tool,
 };
+use mcp_manager::session::{parse_env, AddServerRequest, Session};
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_key, BrowserError, BrowserOpener,
     MemorySecretStore, SecretStore,
-};
-use mcp_manager::{
-    session::{parse_env, AddServerRequest, Session},
 };
 
 struct StaticBackend {
@@ -103,10 +101,7 @@ fn local_add(name: &str) -> AddServerRequest {
 
 #[test]
 fn aggregator_endpoint_is_localhost_streamable_http() {
-    assert_eq!(
-        Session::aggregator_endpoint(),
-        "http://127.0.0.1:8757/mcp"
-    );
+    assert_eq!(Session::aggregator_endpoint(), "http://127.0.0.1:8757/mcp");
 }
 
 #[test]
@@ -207,14 +202,21 @@ async fn delete_server_removes_secrets() {
             .unwrap(),
         None
     );
-    assert_eq!(fx.secrets.get(&server_bearer_key(&config.id)).unwrap(), None);
+    assert_eq!(
+        fx.secrets.get(&server_bearer_key(&config.id)).unwrap(),
+        None
+    );
     assert!(fx.session.list_servers().await.unwrap().is_empty());
 }
 
 #[tokio::test]
 async fn start_and_stop_server() {
     let fx = session(vec![tool("echo")]);
-    let config = fx.session.add_server(local_add("everything")).await.unwrap();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
     fx.session.start_server(&config.id).await.unwrap();
     assert_eq!(
         fx.session.list_servers().await.unwrap()[0].status,
@@ -230,7 +232,11 @@ async fn start_and_stop_server() {
 #[tokio::test]
 async fn list_server_tools_defaults_public() {
     let fx = session(vec![tool("echo"), tool("delete")]);
-    let config = fx.session.add_server(local_add("everything")).await.unwrap();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
     fx.session.start_server(&config.id).await.unwrap();
     let tools = fx.session.list_server_tools(&config.id).await.unwrap();
     assert_eq!(tools.len(), 2);
@@ -240,7 +246,11 @@ async fn list_server_tools_defaults_public() {
 #[tokio::test]
 async fn set_tool_permission_hides_tool() {
     let fx = session(vec![tool("echo"), tool("delete")]);
-    let config = fx.session.add_server(local_add("everything")).await.unwrap();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
     fx.session.start_server(&config.id).await.unwrap();
     fx.session
         .set_tool_permission(&config.id, "delete", false)
@@ -254,7 +264,11 @@ async fn set_tool_permission_hides_tool() {
 #[tokio::test]
 async fn oauth_connect_rejects_local_servers() {
     let fx = session(vec![]);
-    let config = fx.session.add_server(local_add("everything")).await.unwrap();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
     let err = fx.session.oauth_connect(&config.id).await.unwrap_err();
     assert!(err.contains("OAuth"));
 }
