@@ -82,6 +82,12 @@ pub(crate) fn banner_danger(theme: &Theme) -> container::Style {
     banner(tokens.danger, tokens.danger)
 }
 
+/// Accent-tinted banner for the one-time client secret reveal.
+pub(crate) fn banner_accent(theme: &Theme) -> container::Style {
+    let tokens = theme::of(theme);
+    banner(tokens.accent, tokens.accent)
+}
+
 /// Accent-filled button for the one primary action of a pane.
 pub(crate) fn primary(theme: &Theme, status: button::Status) -> button::Style {
     let tokens = theme::of(theme);
