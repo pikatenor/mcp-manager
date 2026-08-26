@@ -103,6 +103,7 @@ pub enum Message {
     WindowClosed(window::Id),
     TrayTick,
     CopyEndpoint,
+    CopyPlaintext,
     ClientName(String),
     IssueToken,
     TokenIssued(Result<IssuedToken, String>),
@@ -306,6 +307,11 @@ impl App {
             }
             Message::TrayTick => self.drain_tray(),
             Message::CopyEndpoint => clipboard::write(self.endpoint.clone()),
+            Message::CopyPlaintext => self
+                .plaintext
+                .clone()
+                .map(clipboard::write)
+                .unwrap_or_else(Task::none),
             Message::ClientName(value) => {
                 self.client_name = value;
                 Task::none()
@@ -607,7 +613,13 @@ impl App {
         );
         if let Some(plaintext) = &self.plaintext {
             body = body.push(text("Copy this secret now; it will not be shown again:"));
-            body = body.push(text(plaintext));
+            body = body.push(
+                row![
+                    text(plaintext),
+                    button("Copy").on_press(Message::CopyPlaintext),
+                ]
+                .spacing(8),
+            );
         }
         if let Some(error) = &self.error {
             body = body.push(text(error).color(hint));
