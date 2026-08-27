@@ -4,6 +4,7 @@
 //! in `mcp-platform`.
 
 pub mod aggregator;
+pub mod mcp_json;
 pub mod naming;
 pub mod permissions;
 pub mod registry;
@@ -16,6 +17,7 @@ pub mod token;
 pub use aggregator::{
     AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer, Tool,
 };
+pub use mcp_json::{parse_mcp_servers, ImportedServer, ParsedImport};
 pub use naming::{prefix_tool_name, strip_server_prefix, TOOL_DELIMITER};
 pub use permissions::is_tool_public;
 pub use registry::{BackendConnector, RegistryError, ServerRegistry, ServerState, ServerStatus};
