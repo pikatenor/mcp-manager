@@ -6,7 +6,7 @@ use mcp_core::{
     AggregatorError, BackendConnector, McpBackend, RegistryError, ServerConfig, ServerStatus,
     ServerType, Tool,
 };
-use mcp_manager::session::{parse_env, AddServerRequest, Session};
+use mcp_manager::session::{parse_env, AddServerRequest, ImportOutcome, Session};
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_key, BrowserError, BrowserOpener,
     MemorySecretStore, SecretStore,
@@ -604,4 +604,122 @@ async fn server_secret_values_returns_env_and_bearer() {
         .unwrap();
     assert_eq!(env.get("B").map(String::as_str), Some("2"));
     assert_eq!(bearer, None);
+}
+
+#[tokio::test]
+async fn import_json_adds_local_and_remote_servers() {
+    let fx = session(vec![]);
+    let outcome = fx
+        .session
+        .import_json(
+            r#"{
+                "mcpServers": {
+                    "everything": {
+                        "command": "npx",
+                        "args": ["-y", "server-everything"],
+                        "env": { "API_TOKEN": "sk-1" }
+                    },
+                    "atlas": {
+                        "url": "https://example.com/mcp",
+                        "headers": { "Authorization": "Bearer tok-1" }
+                    }
+                }
+            }"#,
+        )
+        .await
+        .unwrap();
+    assert!(outcome.skipped.is_empty());
+    assert!(outcome.invalid.is_empty());
+    assert_eq!(outcome.added.len(), 2);
+    assert!(outcome.added.contains(&"everything".to_string()));
+    assert!(outcome.added.contains(&"atlas".to_string()));
+
+    let listed = fx.session.list_servers().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    let by_name: HashMap<_, _> = listed
+        .into_iter()
+        .map(|state| (state.config.name.clone(), state.config))
+        .collect();
+    let everything = by_name.get("everything").unwrap();
+    assert_eq!(everything.command.as_deref(), Some("npx"));
+    assert!(!everything.auto_start);
+    assert_eq!(
+        fx.secrets
+            .get(&server_env_key(&everything.id, "API_TOKEN"))
+            .unwrap()
+            .as_deref(),
+        Some("sk-1")
+    );
+    let atlas = by_name.get("atlas").unwrap();
+    assert_eq!(atlas.server_type, ServerType::RemoteStreamable);
+    assert_eq!(
+        fx.secrets
+            .get(&server_bearer_key(&atlas.id))
+            .unwrap()
+            .as_deref(),
+        Some("tok-1")
+    );
+}
+
+#[tokio::test]
+async fn import_json_skips_existing_names() {
+    let fx = session(vec![]);
+    fx.session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    let outcome = fx
+        .session
+        .import_json(
+            r#"{ "mcpServers": {
+                "everything": { "command": "npx" },
+                "atlas": { "url": "https://example.com/mcp" }
+            } }"#,
+        )
+        .await
+        .unwrap();
+    assert_eq!(outcome.skipped, vec!["everything".to_string()]);
+    assert_eq!(outcome.added, vec!["atlas".to_string()]);
+    assert!(outcome.invalid.is_empty());
+    assert_eq!(fx.session.list_servers().await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn import_json_reports_invalid_entries_without_aborting() {
+    let fx = session(vec![]);
+    let outcome = fx
+        .session
+        .import_json(r#"{ "mcpServers": { "good": { "command": "npx" }, "bad": {} } }"#)
+        .await
+        .unwrap();
+    assert_eq!(outcome.added, vec!["good".to_string()]);
+    assert_eq!(outcome.invalid.len(), 1);
+    assert!(outcome.invalid[0].starts_with("bad: "));
+    assert_eq!(fx.session.list_servers().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn import_json_invalid_document_adds_nothing() {
+    let fx = session(vec![]);
+    let outcome = fx.session.import_json("not json").await.unwrap();
+    assert!(outcome.added.is_empty());
+    assert!(outcome.skipped.is_empty());
+    assert_eq!(outcome.invalid.len(), 1);
+    assert!(fx.session.list_servers().await.unwrap().is_empty());
+}
+
+#[test]
+fn import_outcome_summary_lists_counts() {
+    let outcome = ImportOutcome {
+        added: vec!["a".into()],
+        skipped: vec!["b".into(), "c".into()],
+        invalid: vec!["d: bad".into()],
+    };
+    let summary = outcome.summary();
+    assert!(summary.contains("imported 1 (a)"));
+    assert!(summary.contains("skipped 2 (already exist: b, c)"));
+    assert!(summary.contains("1 invalid (d: bad)"));
+
+    let empty = ImportOutcome::default();
+    assert!(empty.summary().contains("No servers"));
 }

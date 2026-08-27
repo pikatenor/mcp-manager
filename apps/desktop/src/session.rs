@@ -1,11 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_core::{
-    is_tool_public, Aggregator, BackendConnector, IssuedToken, ServerConfig, ServerRegistry,
-    ServerState, ServerStatus, ServerType, TokenRecord, TokenService,
+    is_tool_public, Aggregator, BackendConnector, ImportedServer, IssuedToken, ServerConfig,
+    ServerRegistry, ServerState, ServerStatus, ServerType, TokenRecord, TokenService,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_key, BrowserOpener, SecretStore,
@@ -39,6 +39,63 @@ pub struct AddServerRequest {
 pub struct ServerToolView {
     pub name: String,
     pub public: bool,
+}
+
+/// Report of one JSON import: what was added, skipped, and why others failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportOutcome {
+    pub added: Vec<String>,
+    pub skipped: Vec<String>,
+    pub invalid: Vec<String>,
+}
+
+impl ImportOutcome {
+    /// One-line report for the notice banner.
+    pub fn summary(&self) -> String {
+        let mut parts = Vec::new();
+        if !self.added.is_empty() {
+            parts.push(format!(
+                "imported {} ({})",
+                self.added.len(),
+                self.added.join(", ")
+            ));
+        }
+        if !self.skipped.is_empty() {
+            parts.push(format!(
+                "skipped {} (already exist: {})",
+                self.skipped.len(),
+                self.skipped.join(", ")
+            ));
+        }
+        if !self.invalid.is_empty() {
+            parts.push(format!(
+                "{} invalid ({})",
+                self.invalid.len(),
+                self.invalid.join("; ")
+            ));
+        }
+        if parts.is_empty() {
+            "No servers found to import".into()
+        } else {
+            parts.join("; ")
+        }
+    }
+}
+
+impl From<ImportedServer> for AddServerRequest {
+    fn from(server: ImportedServer) -> Self {
+        // Imported servers start stopped; auto-start is a per-server choice.
+        Self {
+            name: server.name,
+            server_type: server.server_type,
+            command: server.command,
+            args: server.args,
+            env: server.env,
+            remote_url: server.remote_url,
+            auto_start: false,
+            bearer: server.bearer,
+        }
+    }
 }
 
 pub fn parse_env(raw: &str) -> HashMap<String, String> {
@@ -301,6 +358,38 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    /// Import servers from a Cursor/Claude Desktop style config document.
+    /// Same-name entries are skipped; invalid entries are reported, not fatal.
+    pub async fn import_json(&self, raw: &str) -> Result<ImportOutcome, String> {
+        let parsed = mcp_core::parse_mcp_servers(raw);
+        let mut known: HashSet<String> = self
+            .registry
+            .lock()
+            .await
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|state| state.config.name.trim().to_string())
+            .collect();
+        let mut outcome = ImportOutcome::default();
+        for server in parsed.servers {
+            let name = server.name.clone();
+            if known.contains(&name) {
+                outcome.skipped.push(name);
+                continue;
+            }
+            match self.add_server(server.into()).await {
+                Ok(_) => {
+                    known.insert(name.clone());
+                    outcome.added.push(name);
+                }
+                Err(error) => outcome.invalid.push(format!("{name}: {error}")),
+            }
+        }
+        outcome.invalid.extend(parsed.errors);
+        Ok(outcome)
     }
 
     pub async fn delete_server(&self, id: &str) -> Result<bool, String> {
