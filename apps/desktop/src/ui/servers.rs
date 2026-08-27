@@ -16,7 +16,14 @@ use super::{
 };
 
 pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let mut body = column![pane_heading("Servers", app.servers.len())].spacing(16);
+    let heading = row![
+        pane_heading("Servers", app.servers.len()),
+        space::horizontal(),
+        primary_button("+ Add server").on_press(Message::ToggleAddForm),
+    ]
+    .align_y(Alignment::Center);
+
+    let mut body = column![heading].spacing(16);
 
     if app.show_add_form {
         body = body.push(card(add_form(app)));
