@@ -60,11 +60,3 @@ Lint for this repo is **clippy**, not golangci-lint.
 ## Do not
 
 - Store secret values in SQLite, logs, or commit messages.
-- Run GraphQL mutations or gRPC write RPCs (`Create*`, `Delete*`, `Update*`, `Set*`, `Put*`, `Add*`, `Remove*`, `Modify*`, `Insert*`, `Upsert*`, `Save*`, `Submit*`, `Generate*`, `Apply*`, `Replace*`, `Patch*`, `Register*`, `Upload*`, `Archive*`, `Assign*`, `Execute*`, `Run*`).
-- Broaden inbound transports or add a second MCP SDK “just in case”. Upstream stdio/Streamable-HTTP connections ride on `rmcp` in `mcp-runtime`; the hand-rolled JSON-RPC client stays only for the deprecated legacy SSE transport.
-
-
-
-## Follow-ups (only if asked)
-
-JSON config import, writing Cursor/Claude `mcp.json`, request logs, OAuth refresh-on-start, Linux `mcp-platform` impl, public SSE endpoint, stdio CLI bridge.

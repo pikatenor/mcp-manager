@@ -21,7 +21,7 @@ v1 is **macOS only**. OS I/O (keychain, paths, browser) lives behind traits in `
 - Remote MCP OAuth (PKCE S256, loopback `http://127.0.0.1:<port>/oauth/callback`)
 - Hide-on-close tray; quit and copy endpoint from the menu bar
 
-**Not in v1:** projects, writing client `mcp.json`, JSON/DXT import, marketplace, Windows, serving SSE as *our* public transport, stdio CLI bridge.
+**Not in v1:** projects, writing client `mcp.json`, marketplace, OAuth refresh-on-start, cross-platform `mcp-platform` impl (Linux, Windows), serving SSE as *our* public transport, stdio CLI bridge.
 
 ## Layout
 
@@ -57,10 +57,7 @@ cargo test -p mcp-platform
 ```
 
 Point a client at `http://127.0.0.1:8757/mcp` with `Authorization: Bearer <token>` issued in the UI.
-
-## Clients
-
-Inbound transport is Streamable HTTP only (JSON-RPC `initialize`, `tools/list`, `tools/call`). There is no public SSE `/mcp/sse` and no stdio `connect` CLI in v1.
+Inbound transport is Streamable HTTP only (JSON-RPC `initialize`, `tools/list`, `tools/call`).
 
 ## License
 
