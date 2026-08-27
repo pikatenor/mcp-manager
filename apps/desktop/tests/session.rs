@@ -99,6 +99,84 @@ fn local_add(name: &str) -> AddServerRequest {
     }
 }
 
+fn remote_add(name: &str) -> AddServerRequest {
+    AddServerRequest {
+        name: name.into(),
+        server_type: ServerType::RemoteStreamable,
+        command: None,
+        args: vec![],
+        env: HashMap::new(),
+        remote_url: Some("https://example.com/mcp".into()),
+        auto_start: true,
+        bearer: None,
+    }
+}
+
+#[derive(Default)]
+struct SpyConnector {
+    seen: std::sync::Mutex<Vec<(String, HashMap<String, String>)>>,
+}
+
+#[async_trait]
+impl BackendConnector for SpyConnector {
+    async fn connect(
+        &self,
+        config: &ServerConfig,
+        secrets: &HashMap<String, String>,
+    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((config.id.clone(), secrets.clone()));
+        Ok(Arc::new(StaticBackend { tools: vec![] }))
+    }
+}
+
+struct ToggleConnector {
+    fail: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl BackendConnector for ToggleConnector {
+    async fn connect(
+        &self,
+        _config: &ServerConfig,
+        _secrets: &HashMap<String, String>,
+    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err(RegistryError::Backend("connect failed".into()))
+        } else {
+            Ok(Arc::new(StaticBackend { tools: vec![] }))
+        }
+    }
+}
+
+fn open_session(
+    connector: Arc<dyn BackendConnector>,
+) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let secrets = Arc::new(MemorySecretStore::new());
+    let session = Session::open(dir.path(), connector, secrets.clone(), Arc::new(NoopBrowser))
+        .unwrap();
+    Fixture {
+        session,
+        secrets,
+        _dir: dir,
+    }
+}
+
+fn spy_session() -> (Fixture, Arc<SpyConnector>) {
+    let spy = Arc::new(SpyConnector::default());
+    (open_session(spy.clone()), spy)
+}
+
+fn toggle_session() -> (Fixture, Arc<ToggleConnector>) {
+    let toggle = Arc::new(ToggleConnector {
+        fail: std::sync::atomic::AtomicBool::new(false),
+    });
+    (open_session(toggle.clone()), toggle)
+}
+
 #[test]
 fn aggregator_endpoint_is_localhost_streamable_http() {
     assert_eq!(Session::aggregator_endpoint(), "http://127.0.0.1:8757/mcp");
@@ -306,4 +384,224 @@ async fn auto_start_starts_flagged_servers() {
         .collect();
     assert_eq!(by_name.get("auto"), Some(&ServerStatus::Running));
     assert_eq!(by_name.get("manual"), Some(&ServerStatus::Stopped));
+}
+
+#[tokio::test]
+async fn add_server_rejects_duplicate_name() {
+    let fx = session(vec![]);
+    fx.session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    let err = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap_err();
+    assert!(err.contains("already exists"));
+    assert_eq!(fx.session.list_servers().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn update_server_rewrites_config_and_preserves_permissions() {
+    let fx = session(vec![tool("echo"), tool("delete")]);
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    fx.session
+        .set_tool_permission(&config.id, "delete", false)
+        .await
+        .unwrap();
+
+    let mut request = local_add("renamed");
+    request.command = Some("docker".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+
+    let listed = fx.session.list_servers().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].config.id, config.id);
+    assert_eq!(listed[0].config.name, "renamed");
+    assert_eq!(listed[0].config.command.as_deref(), Some("docker"));
+    assert_eq!(
+        listed[0].config.tool_permissions.get("delete"),
+        Some(&false)
+    );
+}
+
+#[tokio::test]
+async fn update_server_replaces_env_secrets() {
+    let fx = session(vec![]);
+    let mut request = local_add("everything");
+    request.env.insert("A".into(), "1".into());
+    request.env.insert("B".into(), "2".into());
+    let config = fx.session.add_server(request).await.unwrap();
+
+    let mut request = local_add("everything");
+    request.env.insert("A".into(), "3".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fx.secrets
+            .get(&server_env_key(&config.id, "A"))
+            .unwrap()
+            .as_deref(),
+        Some("3")
+    );
+    assert_eq!(
+        fx.secrets.get(&server_env_key(&config.id, "B")).unwrap(),
+        None
+    );
+    let listed = fx.session.list_servers().await.unwrap();
+    assert_eq!(listed[0].config.env_keys, vec!["A".to_string()]);
+}
+
+#[tokio::test]
+async fn update_server_keeps_bearer_when_blank_and_overwrites_when_set() {
+    let fx = session(vec![]);
+    let mut request = remote_add("remote");
+    request.bearer = Some("tok-1".into());
+    let config = fx.session.add_server(request).await.unwrap();
+
+    let request = remote_add("remote");
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_bearer_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("tok-1")
+    );
+
+    let mut request = remote_add("remote");
+    request.bearer = Some("tok-2".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_bearer_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("tok-2")
+    );
+}
+
+#[tokio::test]
+async fn update_server_restarts_running_server() {
+    let (fx, spy) = spy_session();
+    let mut request = local_add("everything");
+    request.env.insert("API_TOKEN".into(), "sk-1".into());
+    let config = fx.session.add_server(request).await.unwrap();
+    fx.session.start_server(&config.id).await.unwrap();
+
+    let mut request = local_add("everything");
+    request.env.insert("API_TOKEN".into(), "sk-2".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fx.session.list_servers().await.unwrap()[0].status,
+        ServerStatus::Running
+    );
+    let seen = spy.seen.lock().unwrap();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(
+        seen[1].1.get("API_TOKEN").map(String::as_str),
+        Some("sk-2")
+    );
+}
+
+#[tokio::test]
+async fn update_server_reports_unknown_id() {
+    let fx = session(vec![]);
+    let err = fx
+        .session
+        .update_server("srv-none", local_add("x"))
+        .await
+        .unwrap_err();
+    assert!(err.contains("unknown server"));
+}
+
+#[tokio::test]
+async fn update_server_saves_when_restart_fails() {
+    let (fx, toggle) = toggle_session();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    fx.session.start_server(&config.id).await.unwrap();
+    toggle
+        .fail
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    fx.session
+        .update_server(&config.id, local_add("renamed"))
+        .await
+        .unwrap();
+
+    let listed = fx.session.list_servers().await.unwrap();
+    assert_eq!(listed[0].config.name, "renamed");
+    assert_eq!(listed[0].status, ServerStatus::Error);
+    assert!(listed[0].last_error.is_some());
+}
+
+#[tokio::test]
+async fn update_server_rejects_rename_onto_existing() {
+    let fx = session(vec![]);
+    fx.session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    let other = fx.session.add_server(local_add("other")).await.unwrap();
+
+    let err = fx
+        .session
+        .update_server(&other.id, local_add("everything"))
+        .await
+        .unwrap_err();
+    assert!(err.contains("already exists"));
+    let listed = fx.session.list_servers().await.unwrap();
+    assert_eq!(listed[1].config.name, "other");
+}
+
+#[tokio::test]
+async fn server_secret_values_returns_env_and_bearer() {
+    let fx = session(vec![]);
+    let mut remote = remote_add("remote");
+    remote.env.insert("A".into(), "1".into());
+    remote.bearer = Some("tok-1".into());
+    let config = fx.session.add_server(remote).await.unwrap();
+    let (env, bearer) = fx
+        .session
+        .server_secret_values(&config.id)
+        .await
+        .unwrap();
+    assert_eq!(env.get("A").map(String::as_str), Some("1"));
+    assert_eq!(bearer.as_deref(), Some("tok-1"));
+
+    let mut local = local_add("everything");
+    local.env.insert("B".into(), "2".into());
+    let config = fx.session.add_server(local).await.unwrap();
+    let (env, bearer) = fx
+        .session
+        .server_secret_values(&config.id)
+        .await
+        .unwrap();
+    assert_eq!(env.get("B").map(String::as_str), Some("2"));
+    assert_eq!(bearer, None);
 }

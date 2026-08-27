@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_core::{
     is_tool_public, Aggregator, BackendConnector, IssuedToken, ServerConfig, ServerRegistry,
-    ServerState, ServerType, TokenRecord, TokenService,
+    ServerState, ServerStatus, ServerType, TokenRecord, TokenService,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_key, BrowserOpener, SecretStore,
@@ -182,6 +182,19 @@ impl Session {
         if name.is_empty() {
             return Err("server name is required".into());
         }
+        // Pre-check before persisting secrets so a rejected add cannot orphan
+        // keychain entries; the registry check stays the authority.
+        {
+            let registry = self.registry.lock().await;
+            let duplicate = registry
+                .list()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .any(|state| state.config.name.trim() == name);
+            if duplicate {
+                return Err(format!("server name already exists: {name}"));
+            }
+        }
         let id = new_server_id();
         let env_keys: Vec<String> = request.env.keys().cloned().collect();
         persist_secrets(
@@ -208,6 +221,86 @@ impl Session {
             .await
             .add(config)
             .map_err(|e| e.to_string())
+    }
+
+    /// Env values and bearer for one server, for edit-form prefill.
+    pub async fn server_secret_values(
+        &self,
+        id: &str,
+    ) -> Result<(HashMap<String, String>, Option<String>), String> {
+        let config = self
+            .registry
+            .lock()
+            .await
+            .list()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .ok_or_else(|| format!("unknown server: {id}"))?
+            .config;
+        let mut env = HashMap::new();
+        for key in &config.env_keys {
+            if let Some(value) = self
+                .secrets
+                .get(&server_env_key(&config.id, key))
+                .map_err(|e| e.to_string())?
+            {
+                env.insert(key.clone(), value);
+            }
+        }
+        let bearer = self
+            .secrets
+            .get(&server_bearer_key(&config.id))
+            .map_err(|e| e.to_string())?
+            .filter(|value| !value.is_empty());
+        Ok((env, bearer))
+    }
+
+    /// Rewrite one server's config in place, keeping its id, disabled flag,
+    /// and tool permissions. A running server is restarted on the new config.
+    pub async fn update_server(&self, id: &str, request: AddServerRequest) -> Result<(), String> {
+        let name = request.name.trim();
+        if name.is_empty() {
+            return Err("server name is required".into());
+        }
+        let (existing, was_running) = {
+            // Scoped lock: update validates and persists before any keychain
+            // mutation, and the lock must be released before stop/start.
+            let mut registry = self.registry.lock().await;
+            let state = registry
+                .list()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|state| state.config.id == id)
+                .ok_or_else(|| format!("unknown server: {id}"))?;
+            let was_running = state.status == ServerStatus::Running;
+            let mut updated = state.config.clone();
+            updated.name = name.to_string();
+            updated.server_type = request.server_type;
+            updated.command = request.command.filter(|c| !c.trim().is_empty());
+            updated.args = request.args;
+            updated.env_keys = request.env.keys().cloned().collect();
+            updated.remote_url = request.remote_url.filter(|u| !u.trim().is_empty());
+            updated.auto_start = request.auto_start;
+            registry.update(updated).map_err(|e| e.to_string())?;
+            (state.config, was_running)
+        };
+        for key in &existing.env_keys {
+            if !request.env.contains_key(key) {
+                let _ = self.secrets.delete(&server_env_key(id, key));
+            }
+        }
+        persist_secrets(self.secrets.as_ref(), id, &request.env, request.bearer.as_deref())
+            .map_err(|e| e.to_string())?;
+        if was_running {
+            let _ = self.stop_server(id).await;
+            if let Err(error) = self.start_server(id).await {
+                // The save itself succeeded; the failed restart surfaces as
+                // the server's Error status and last_error.
+                eprintln!("restart after update failed for {id}: {error}");
+            }
+        }
+        Ok(())
     }
 
     pub async fn delete_server(&self, id: &str) -> Result<bool, String> {
