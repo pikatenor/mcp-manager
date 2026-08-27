@@ -7,7 +7,7 @@ use mcp_core::{IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord};
 use mcp_platform::{AppPaths, NativeAppPaths, NativeBrowserOpener, SecretStore};
 use mcp_runtime::McpConnector;
 
-use crate::session::{parse_env, AddServerRequest, ServerToolView, Session};
+use crate::session::{parse_env, AddServerRequest, ImportOutcome, ServerToolView, Session};
 use crate::shell::{on_close_requested, ShellAction};
 use crate::ui;
 #[cfg(target_os = "macos")]
@@ -206,6 +206,9 @@ pub(crate) struct App {
     pub(crate) section: Section,
     pub(crate) show_add_form: bool,
     pub(crate) editing_id: Option<String>,
+    pub(crate) show_import_form: bool,
+    pub(crate) import_json: text_editor::Content,
+    pub(crate) notice: Option<String>,
     pub(crate) client_name: String,
     pub(crate) tokens: Vec<TokenRecord>,
     pub(crate) plaintext: Option<String>,
@@ -237,6 +240,11 @@ pub enum Message {
     EditServer(String),
     EditLoaded(Result<EditFormState, String>),
     UpdateServer,
+    ImportText(text_editor::Action),
+    ToggleImportForm,
+    CancelImportForm,
+    ImportJson,
+    ImportDone(Result<ImportOutcome, String>),
     ClientName(String),
     IssueToken,
     TokenIssued(Result<IssuedToken, String>),
@@ -334,6 +342,9 @@ impl App {
             section: Section::Servers,
             show_add_form: false,
             editing_id: None,
+            show_import_form: false,
+            import_json: text_editor::Content::new(),
+            notice: None,
             client_name: String::from("cursor"),
             tokens: Vec::new(),
             plaintext: None,
@@ -464,15 +475,61 @@ impl App {
                 if self.editing_id.is_some() {
                     self.clear_form();
                 }
+                self.show_import_form = false;
+                self.notice = None;
                 self.show_add_form = !self.show_add_form;
                 Task::none()
             }
             Message::CancelAddForm => {
                 self.clear_form();
                 self.show_add_form = false;
+                self.notice = None;
                 Task::none()
             }
+            Message::ToggleImportForm => {
+                if self.show_add_form {
+                    self.clear_form();
+                    self.show_add_form = false;
+                }
+                self.notice = None;
+                self.show_import_form = !self.show_import_form;
+                Task::none()
+            }
+            Message::CancelImportForm => {
+                self.import_json = text_editor::Content::new();
+                self.show_import_form = false;
+                self.notice = None;
+                Task::none()
+            }
+            Message::ImportText(action) => {
+                self.import_json.perform(action);
+                Task::none()
+            }
+            Message::ImportJson => {
+                let session = self.session.clone();
+                let raw = self.import_json.text();
+                self.notice = None;
+                Task::perform(
+                    async move { session.import_json(&raw).await },
+                    Message::ImportDone,
+                )
+            }
+            Message::ImportDone(result) => match result {
+                Ok(outcome) => {
+                    self.notice = Some(outcome.summary());
+                    self.import_json = text_editor::Content::new();
+                    self.show_import_form = false;
+                    self.error = None;
+                    self.refresh()
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    Task::none()
+                }
+            },
             Message::EditServer(id) => {
+                self.show_import_form = false;
+                self.notice = None;
                 let session = self.session.clone();
                 Task::perform(
                     async move {
@@ -583,6 +640,7 @@ impl App {
             }
             Message::AddServer => {
                 let session = self.session.clone();
+                self.notice = None;
                 let request = add_request_from_form(self.form_input());
                 Task::perform(async move { session.add_server(request).await }, |result| {
                     match result {
@@ -596,6 +654,7 @@ impl App {
                     return Task::none();
                 };
                 let session = self.session.clone();
+                self.notice = None;
                 let request = add_request_from_form(self.form_input());
                 Task::perform(
                     async move { session.update_server(&id, request).await },
@@ -621,6 +680,7 @@ impl App {
             }
             Message::Delete(id) => {
                 let session = self.session.clone();
+                self.notice = None;
                 Task::perform(
                     async move { session.delete_server(&id).await.map(|_| ()) },
                     Message::OpDone,

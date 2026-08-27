@@ -19,11 +19,23 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     let heading = row![
         pane_heading("Servers", app.servers.len()),
         space::horizontal(),
-        primary_button("+ Add server").on_press(Message::ToggleAddForm),
+        row![
+            secondary_button("Import JSON").on_press(Message::ToggleImportForm),
+            primary_button("+ Add server").on_press(Message::ToggleAddForm),
+        ]
+        .spacing(8)
     ]
     .align_y(Alignment::Center);
 
     let mut body = column![heading].spacing(16);
+
+    if let Some(notice) = &app.notice {
+        body = body.push(super::notice_banner(notice));
+    }
+
+    if app.show_import_form {
+        body = body.push(card(import_form(app)));
+    }
 
     if app.show_add_form {
         body = body.push(card(add_form(app)));
@@ -216,4 +228,24 @@ fn field<'a>(
     input: impl Into<iced::Element<'a, Message>>,
 ) -> iced::widget::Column<'a, Message> {
     column![form_label(label), input.into()].spacing(4)
+}
+
+fn import_form(app: &App) -> iced::widget::Column<'_, Message> {
+    let mut form = column![text("Import JSON").size(15).font(SEMIBOLD)].spacing(12);
+    form = form.push(
+        text_editor(&app.import_json)
+            .placeholder(r#"{ "mcpServers": { ... } }"#)
+            .height(Length::Fixed(120.0))
+            .on_action(Message::ImportText),
+    );
+    form = form.push(secondary(
+        "Paste a Cursor or Claude Desktop mcp.json. Entries whose name already exists are skipped.",
+    ));
+    form.push(
+        row![
+            primary_button("Import").on_press(Message::ImportJson),
+            secondary_button("Cancel").on_press(Message::CancelImportForm),
+        ]
+        .spacing(8),
+    )
 }

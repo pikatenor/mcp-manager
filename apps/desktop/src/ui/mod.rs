@@ -110,3 +110,10 @@ pub(crate) fn error_banner(error: &str) -> container::Container<'_, Message> {
     .padding(CARD_PADDING)
     .style(styles::banner_danger)
 }
+
+/// Full-width accent banner for operation reports (e.g. import results).
+pub(crate) fn notice_banner(notice: &str) -> container::Container<'_, Message> {
+    container(text(notice).size(13))
+        .padding(CARD_PADDING)
+        .style(styles::banner_accent)
+}
