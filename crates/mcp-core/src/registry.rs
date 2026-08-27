@@ -38,6 +38,8 @@ pub enum RegistryError {
     RemoteUrl(#[from] super::remote_url::RemoteUrlError),
     #[error("unknown server: {0}")]
     UnknownServer(String),
+    #[error("server name already exists: {0}")]
+    DuplicateName(String),
     #[error("invalid server config: {0}")]
     InvalidConfig(String),
     #[error("backend error: {0}")]
@@ -62,6 +64,16 @@ pub struct ServerRegistry {
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), RegistryError> {
+    let name = config.name.trim();
+    if name.is_empty() {
+        return Err(RegistryError::InvalidConfig("server name is required".into()));
+    }
+    if name.contains(crate::naming::TOOL_DELIMITER) {
+        return Err(RegistryError::InvalidConfig(format!(
+            "server names must not contain \"{}\"",
+            crate::naming::TOOL_DELIMITER
+        )));
+    }
     match config.server_type {
         ServerType::Local => Ok(()),
         ServerType::Remote | ServerType::RemoteStreamable => {
@@ -91,16 +103,32 @@ impl ServerRegistry {
 
     pub fn add(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
+        self.ensure_unique_name(&config.name, None)?;
         Ok(self.store.add(config)?)
     }
 
     pub fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
+        self.ensure_unique_name(&config.name, Some(&config.id))?;
         let updated = self.store.update(config)?;
         if let Ok(mut aggregator) = self.aggregator.try_lock() {
             aggregator.set_tool_permissions(&updated.id, updated.tool_permissions.clone());
         }
         Ok(updated)
+    }
+
+    fn ensure_unique_name(
+        &self,
+        name: &str,
+        exclude_id: Option<&str>,
+    ) -> Result<(), RegistryError> {
+        let name = name.trim();
+        if self.store.list()?.iter().any(|config| {
+            Some(config.id.as_str()) != exclude_id && config.name.trim() == name
+        }) {
+            return Err(RegistryError::DuplicateName(name.to_string()));
+        }
+        Ok(())
     }
 
     pub async fn delete(&mut self, id: &str) -> Result<bool, RegistryError> {
@@ -481,5 +509,66 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["everything__echo"]);
+    }
+
+    #[test]
+    fn add_rejects_duplicate_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        let err = registry
+            .add(local_config("srv-2", "everything"))
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::DuplicateName(_)));
+        assert_eq!(registry.list().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn add_rejects_blank_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let err = registry.add(local_config("srv-1", "  ")).unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn add_rejects_delimiter_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let err = registry.add(local_config("srv-1", "bad__name")).unwrap_err();
+        assert!(matches!(err, RegistryError::InvalidConfig(_)));
+    }
+
+    #[test]
+    fn update_allows_keeping_own_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        let config = registry.list().unwrap()[0].config.clone();
+        registry.update(config).unwrap();
+        assert_eq!(registry.list().unwrap()[0].config.name, "everything");
+    }
+
+    #[test]
+    fn update_rejects_rename_onto_existing_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        registry.add(local_config("srv-2", "other")).unwrap();
+        let mut config = registry.list().unwrap()[0].config.clone();
+        config.name = "other".into();
+        let err = registry.update(config).unwrap_err();
+        assert!(matches!(err, RegistryError::DuplicateName(_)));
+        assert_eq!(registry.list().unwrap()[0].config.name, "everything");
     }
 }
