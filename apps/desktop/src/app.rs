@@ -536,13 +536,6 @@ impl App {
             ]
             .spacing(2),
         );
-        if self.section == Section::Servers {
-            sidebar_content = sidebar_content.push(
-                ui::primary_button("+ Add server")
-                    .width(Length::Fill)
-                    .on_press(Message::ToggleAddForm),
-            );
-        }
         sidebar_content = sidebar_content.push(space::vertical());
         sidebar_content = sidebar_content.push(ui::secondary(
             "Closing this window hides the app to the menu bar.",
