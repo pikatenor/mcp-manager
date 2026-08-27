@@ -81,12 +81,131 @@ impl From<FormServerType> for ServerType {
     }
 }
 
+impl From<ServerType> for FormServerType {
+    fn from(value: ServerType) -> Self {
+        match value {
+            ServerType::Local => Self::Local,
+            ServerType::Remote => Self::Remote,
+            ServerType::RemoteStreamable => Self::RemoteStreamable,
+        }
+    }
+}
+
+/// Raw add/edit form fields, borrowed from `App` (env text is owned because
+/// the editor hands out an owned `String`).
+#[derive(Debug, Clone)]
+pub(crate) struct FormInput<'a> {
+    pub name: &'a str,
+    pub server_type: FormServerType,
+    pub command: &'a str,
+    pub args: &'a str,
+    pub remote_url: &'a str,
+    pub env_text: String,
+    pub bearer: &'a str,
+    pub auto_start: bool,
+}
+
+/// Build an `AddServerRequest` from the raw form fields.
+pub(crate) fn add_request_from_form(input: FormInput<'_>) -> AddServerRequest {
+    let local = input.server_type == FormServerType::Local;
+    AddServerRequest {
+        name: input.name.to_string(),
+        server_type: input.server_type.into(),
+        command: if local {
+            Some(input.command.to_string())
+        } else {
+            None
+        },
+        args: if local {
+            input.args.split_whitespace().map(str::to_string).collect()
+        } else {
+            Vec::new()
+        },
+        env: parse_env(&input.env_text),
+        remote_url: if local {
+            None
+        } else {
+            Some(input.remote_url.to_string())
+        },
+        auto_start: input.auto_start,
+        bearer: if input.bearer.is_empty() {
+            None
+        } else {
+            Some(input.bearer.to_string())
+        },
+    }
+}
+
+/// Prefilled form values for one server, produced by the EditServer task.
+#[derive(Debug, Clone)]
+pub(crate) struct EditFormState {
+    pub id: String,
+    pub name: String,
+    pub server_type: FormServerType,
+    pub command: String,
+    pub args: String,
+    pub remote_url: String,
+    pub env_text: String,
+    pub bearer: String,
+    pub auto_start: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input(server_type: FormServerType) -> FormInput<'static> {
+        FormInput {
+            name: "everything",
+            server_type,
+            command: "npx",
+            args: "-y server-everything",
+            remote_url: "https://example.com/mcp",
+            env_text: "API_TOKEN=sk-1".to_string(),
+            bearer: "",
+            auto_start: true,
+        }
+    }
+
+    #[test]
+    fn add_request_from_form_local_omits_remote_fields() {
+        let request = add_request_from_form(input(FormServerType::Local));
+        assert_eq!(request.name, "everything");
+        assert_eq!(request.server_type, ServerType::Local);
+        assert_eq!(request.command.as_deref(), Some("npx"));
+        assert_eq!(
+            request.args,
+            vec!["-y".to_string(), "server-everything".to_string()]
+        );
+        assert_eq!(request.remote_url, None);
+        assert_eq!(
+            request.env.get("API_TOKEN").map(String::as_str),
+            Some("sk-1")
+        );
+        assert_eq!(request.bearer, None);
+    }
+
+    #[test]
+    fn add_request_from_form_remote_omits_local_fields_and_blanks_bearer() {
+        let request = add_request_from_form(input(FormServerType::RemoteStreamable));
+        assert_eq!(request.server_type, ServerType::RemoteStreamable);
+        assert_eq!(request.command, None);
+        assert!(request.args.is_empty());
+        assert_eq!(
+            request.remote_url.as_deref(),
+            Some("https://example.com/mcp")
+        );
+        assert_eq!(request.bearer, None);
+    }
+}
+
 pub(crate) struct App {
     session: Session,
     window_id: Option<window::Id>,
     pub(crate) endpoint: String,
     pub(crate) section: Section,
     pub(crate) show_add_form: bool,
+    pub(crate) editing_id: Option<String>,
     pub(crate) client_name: String,
     pub(crate) tokens: Vec<TokenRecord>,
     pub(crate) plaintext: Option<String>,
@@ -115,6 +234,9 @@ pub enum Message {
     Navigate(Section),
     ToggleAddForm,
     CancelAddForm,
+    EditServer(String),
+    EditLoaded(Result<EditFormState, String>),
+    UpdateServer,
     ClientName(String),
     IssueToken,
     TokenIssued(Result<IssuedToken, String>),
@@ -211,6 +333,7 @@ impl App {
             window_id: None,
             section: Section::Servers,
             show_add_form: false,
+            editing_id: None,
             client_name: String::from("cursor"),
             tokens: Vec::new(),
             plaintext: None,
@@ -284,9 +407,28 @@ impl App {
     }
 
     fn clear_form(&mut self) {
+        self.editing_id = None;
         self.server_name.clear();
+        self.server_type = FormServerType::Local;
+        self.command = String::from("npx");
+        self.args = String::from("-y @modelcontextprotocol/server-everything");
+        self.remote_url.clear();
         self.env = text_editor::Content::new();
         self.bearer.clear();
+        self.auto_start = true;
+    }
+
+    fn form_input(&self) -> FormInput<'_> {
+        FormInput {
+            name: &self.server_name,
+            server_type: self.server_type,
+            command: &self.command,
+            args: &self.args,
+            remote_url: &self.remote_url,
+            env_text: self.env.text(),
+            bearer: &self.bearer,
+            auto_start: self.auto_start,
+        }
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
@@ -318,6 +460,10 @@ impl App {
                 Task::none()
             }
             Message::ToggleAddForm => {
+                // Leaving edit mode must not leave stale prefills behind.
+                if self.editing_id.is_some() {
+                    self.clear_form();
+                }
                 self.show_add_form = !self.show_add_form;
                 Task::none()
             }
@@ -326,6 +472,56 @@ impl App {
                 self.show_add_form = false;
                 Task::none()
             }
+            Message::EditServer(id) => {
+                let session = self.session.clone();
+                Task::perform(
+                    async move {
+                        let config = session
+                            .list_servers()
+                            .await?
+                            .into_iter()
+                            .find(|state| state.config.id == id)
+                            .ok_or_else(|| format!("unknown server: {id}"))?
+                            .config;
+                        let (env, bearer) = session.server_secret_values(&id).await?;
+                        let mut lines: Vec<String> =
+                            env.iter().map(|(key, value)| format!("{key}={value}")).collect();
+                        lines.sort();
+                        Ok(EditFormState {
+                            id: id.clone(),
+                            name: config.name,
+                            server_type: config.server_type.into(),
+                            command: config.command.unwrap_or_default(),
+                            args: config.args.join(" "),
+                            remote_url: config.remote_url.unwrap_or_default(),
+                            env_text: lines.join("\n"),
+                            bearer: bearer.unwrap_or_default(),
+                            auto_start: config.auto_start,
+                        })
+                    },
+                    Message::EditLoaded,
+                )
+            }
+            Message::EditLoaded(result) => match result {
+                Ok(form) => {
+                    self.server_name = form.name;
+                    self.server_type = form.server_type;
+                    self.command = form.command;
+                    self.args = form.args;
+                    self.remote_url = form.remote_url;
+                    self.env = text_editor::Content::with_text(&form.env_text);
+                    self.bearer = form.bearer;
+                    self.auto_start = form.auto_start;
+                    self.editing_id = Some(form.id);
+                    self.show_add_form = true;
+                    self.error = None;
+                    Task::none()
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    Task::none()
+                }
+            },
             Message::ClientName(value) => {
                 self.client_name = value;
                 Task::none()
@@ -387,38 +583,27 @@ impl App {
             }
             Message::AddServer => {
                 let session = self.session.clone();
-                let request = AddServerRequest {
-                    name: self.server_name.clone(),
-                    server_type: self.server_type.into(),
-                    command: if self.server_type == FormServerType::Local {
-                        Some(self.command.clone())
-                    } else {
-                        None
-                    },
-                    args: if self.server_type == FormServerType::Local {
-                        self.args.split_whitespace().map(str::to_string).collect()
-                    } else {
-                        Vec::new()
-                    },
-                    env: parse_env(&self.env.text()),
-                    remote_url: if self.server_type == FormServerType::Local {
-                        None
-                    } else {
-                        Some(self.remote_url.clone())
-                    },
-                    auto_start: self.auto_start,
-                    bearer: if self.bearer.is_empty() {
-                        None
-                    } else {
-                        Some(self.bearer.clone())
-                    },
-                };
+                let request = add_request_from_form(self.form_input());
                 Task::perform(async move { session.add_server(request).await }, |result| {
                     match result {
                         Ok(_) => Message::SnapshotReadyClearForm,
                         Err(error) => Message::OpDone(Err(error)),
                     }
                 })
+            }
+            Message::UpdateServer => {
+                let Some(id) = self.editing_id.clone() else {
+                    return Task::none();
+                };
+                let session = self.session.clone();
+                let request = add_request_from_form(self.form_input());
+                Task::perform(
+                    async move { session.update_server(&id, request).await },
+                    |result| match result {
+                        Ok(()) => Message::SnapshotReadyClearForm,
+                        Err(error) => Message::OpDone(Err(error)),
+                    },
+                )
             }
             Message::Start(id) => {
                 let session = self.session.clone();

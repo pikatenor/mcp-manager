@@ -67,6 +67,7 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
         }
 
         let mut actions = row![].spacing(8);
+        actions = actions.push(secondary_button("Edit").on_press(Message::EditServer(id.clone())));
         if server.status == ServerStatus::Running {
             actions =
                 actions.push(secondary_button("Stop").on_press(Message::Stop(id.clone())));
@@ -121,7 +122,13 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 }
 
 fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
-    let mut form = column![text("Add server").size(15).font(SEMIBOLD)].spacing(12);
+    let editing = app.editing_id.is_some();
+    let (title, submit_label, submit) = if editing {
+        ("Edit server", "Save", Message::UpdateServer)
+    } else {
+        ("Add server", "Add server", Message::AddServer)
+    };
+    let mut form = column![text(title).size(15).font(SEMIBOLD)].spacing(12);
 
     form = form.push(field("Name", {
         let mut inputs = row![text_input("server name", &app.server_name)
@@ -169,11 +176,23 @@ fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
     ));
 
     if app.server_type != FormServerType::Local {
-        form = form.push(field(
-            "Bearer",
+        // An OAuth-connected server keeps its token in the keychain; editing
+        // the mirror by hand would only fight the OAuth flow.
+        let oauth_managed = editing
+            && app
+                .editing_id
+                .as_deref()
+                .and_then(|id| app.oauth_by_server.get(id))
+                .copied()
+                .unwrap_or(false);
+        let bearer_field: iced::Element<'_, Message> = if oauth_managed {
+            secondary("Authentication is managed by OAuth.").into()
+        } else {
             text_input("optional bearer token (stored in keychain)", &app.bearer)
-                .on_input(Message::Bearer),
-        ));
+                .on_input(Message::Bearer)
+                .into()
+        };
+        form = form.push(field("Bearer", bearer_field));
     }
 
     form = form.push(
@@ -184,7 +203,7 @@ fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
 
     form.push(
         row![
-            primary_button("Add server").on_press(Message::AddServer),
+            primary_button(submit_label).on_press(submit),
             secondary_button("Cancel").on_press(Message::CancelAddForm),
         ]
         .spacing(8),
