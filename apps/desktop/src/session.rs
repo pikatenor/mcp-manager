@@ -9,7 +9,8 @@ use mcp_core::{
     ToolCallEntry,
 };
 use mcp_platform::{
-    server_bearer_key, server_env_key, server_oauth_key, BrowserOpener, SecretStore,
+    server_bearer_key, server_env_key, server_oauth_client_id_key,
+    server_oauth_client_secret_key, server_oauth_key, BrowserOpener, SecretStore,
     SecretStoreError,
 };
 use mcp_runtime::OAuthFlow;
@@ -35,6 +36,21 @@ pub struct AddServerRequest {
     pub remote_url: Option<String>,
     pub auto_start: bool,
     pub bearer: Option<String>,
+    /// Pre-registered OAuth client id. `None`/blank clears the static client
+    /// config on update; the form prefills it, so blank means emptied.
+    pub oauth_client_id: Option<String>,
+    /// Pre-registered OAuth client secret. `None`/blank keeps the stored one:
+    /// the form never echoes it back, so blank means unchanged.
+    pub oauth_client_secret: Option<String>,
+}
+
+/// Env values, bearer, and OAuth client id for one server, for edit-form
+/// prefill. The client secret is deliberately not read back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerSecretValues {
+    pub env: HashMap<String, String>,
+    pub bearer: Option<String>,
+    pub oauth_client_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +112,8 @@ impl From<ImportedServer> for AddServerRequest {
             remote_url: server.remote_url,
             auto_start: false,
             bearer: server.bearer,
+            oauth_client_id: None,
+            oauth_client_secret: None,
         }
     }
 }
@@ -157,6 +175,45 @@ fn persist_secrets(
     Ok(())
 }
 
+/// Set-or-clear the static OAuth client identity. A blank id clears both keys
+/// (the form prefills it, so blank means emptied); a blank secret keeps the
+/// stored one (the form never echoes it back).
+fn persist_oauth_client(
+    store: &dyn SecretStore,
+    id: &str,
+    client_id: Option<&str>,
+    client_secret: Option<&str>,
+) -> Result<(), SecretStoreError> {
+    let Some(client_id) = client_id.map(str::trim).filter(|value| !value.is_empty()) else {
+        store.delete(&server_oauth_client_id_key(id))?;
+        store.delete(&server_oauth_client_secret_key(id))?;
+        return Ok(());
+    };
+    store.set(&server_oauth_client_id_key(id), client_id)?;
+    if let Some(secret) = client_secret.map(str::trim).filter(|value| !value.is_empty()) {
+        store.set(&server_oauth_client_secret_key(id), secret)?;
+    }
+    Ok(())
+}
+
+/// Shared add/update validation, run before any keychain write.
+fn validate_oauth_client(request: &AddServerRequest) -> Result<(), String> {
+    let has_id = request
+        .oauth_client_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    let has_secret = request
+        .oauth_client_secret
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if has_secret && !has_id {
+        return Err("oauth client secret requires a client id".into());
+    }
+    Ok(())
+}
+
 fn delete_secrets(store: &dyn SecretStore, config: &ServerConfig) {
     for key in &config.env_keys {
         let _ = store.delete(&server_env_key(&config.id, key));
@@ -164,7 +221,8 @@ fn delete_secrets(store: &dyn SecretStore, config: &ServerConfig) {
     let _ = store.delete(&server_bearer_key(&config.id));
     let _ = store.delete(&server_oauth_key(&config.id, "access_token"));
     let _ = store.delete(&server_oauth_key(&config.id, "refresh_token"));
-    let _ = store.delete(&server_oauth_key(&config.id, "client_id"));
+    let _ = store.delete(&server_oauth_client_id_key(&config.id));
+    let _ = store.delete(&server_oauth_client_secret_key(&config.id));
     let _ = store.delete(&server_oauth_key(&config.id, "credentials"));
 }
 
@@ -258,6 +316,7 @@ impl Session {
         if name.is_empty() {
             return Err("server name is required".into());
         }
+        validate_oauth_client(&request)?;
         // Pre-check before persisting secrets so a rejected add cannot orphan
         // keychain entries; the registry check stays the authority.
         {
@@ -280,6 +339,13 @@ impl Session {
             request.bearer.as_deref(),
         )
         .map_err(|e| e.to_string())?;
+        persist_oauth_client(
+            self.secrets.as_ref(),
+            &id,
+            request.oauth_client_id.as_deref(),
+            request.oauth_client_secret.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         let config = ServerConfig {
             id,
             name: name.to_string(),
@@ -299,11 +365,9 @@ impl Session {
             .map_err(|e| e.to_string())
     }
 
-    /// Env values and bearer for one server, for edit-form prefill.
-    pub async fn server_secret_values(
-        &self,
-        id: &str,
-    ) -> Result<(HashMap<String, String>, Option<String>), String> {
+    /// Env values, bearer, and OAuth client id for one server, for edit-form
+    /// prefill. The client secret is never read back out of the keychain.
+    pub async fn server_secret_values(&self, id: &str) -> Result<ServerSecretValues, String> {
         let config = self
             .registry
             .lock()
@@ -329,7 +393,16 @@ impl Session {
             .get(&server_bearer_key(&config.id))
             .map_err(|e| e.to_string())?
             .filter(|value| !value.is_empty());
-        Ok((env, bearer))
+        let oauth_client_id = self
+            .secrets
+            .get(&server_oauth_client_id_key(&config.id))
+            .map_err(|e| e.to_string())?
+            .filter(|value| !value.is_empty());
+        Ok(ServerSecretValues {
+            env,
+            bearer,
+            oauth_client_id,
+        })
     }
 
     /// Rewrite one server's config in place, keeping its id, disabled flag,
@@ -339,6 +412,7 @@ impl Session {
         if name.is_empty() {
             return Err("server name is required".into());
         }
+        validate_oauth_client(&request)?;
         let (existing, was_running) = {
             // Scoped lock: update validates and persists before any keychain
             // mutation, and the lock must be released before stop/start.
@@ -361,6 +435,16 @@ impl Session {
             registry.update(updated).map_err(|e| e.to_string())?;
             (state.config, was_running)
         };
+        let old_client_id = self
+            .secrets
+            .get(&server_oauth_client_id_key(id))
+            .map_err(|e| e.to_string())?
+            .filter(|value| !value.is_empty());
+        let old_client_secret = self
+            .secrets
+            .get(&server_oauth_client_secret_key(id))
+            .map_err(|e| e.to_string())?
+            .filter(|value| !value.is_empty());
         for key in &existing.env_keys {
             if !request.env.contains_key(key) {
                 let _ = self.secrets.delete(&server_env_key(id, key));
@@ -368,6 +452,38 @@ impl Session {
         }
         persist_secrets(self.secrets.as_ref(), id, &request.env, request.bearer.as_deref())
             .map_err(|e| e.to_string())?;
+        persist_oauth_client(
+            self.secrets.as_ref(),
+            id,
+            request.oauth_client_id.as_deref(),
+            request.oauth_client_secret.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
+        // Tokens minted under one client identity cannot refresh under
+        // another, so a changed static client config invalidates the
+        // flow-derived token state (a re-typed identical config does not).
+        let new_client_id = request
+            .oauth_client_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let new_client_secret = request
+            .oauth_client_secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let client_config_changed = new_client_id != old_client_id.as_deref()
+            || new_client_secret.is_some_and(|secret| Some(secret) != old_client_secret.as_deref());
+        if client_config_changed {
+            for key in [
+                server_oauth_key(id, "credentials"),
+                server_bearer_key(id),
+                server_oauth_key(id, "access_token"),
+                server_oauth_key(id, "refresh_token"),
+            ] {
+                let _ = self.secrets.delete(&key);
+            }
+        }
         if was_running {
             let _ = self.stop_server(id).await;
             if let Err(error) = self.start_server(id).await {
