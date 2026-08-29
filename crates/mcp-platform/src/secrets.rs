@@ -1,8 +1,18 @@
+use std::collections::HashMap;
+
 /// OS credential store. Implementations must not log values.
 pub trait SecretStore: Send + Sync {
     fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError>;
     fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError>;
     fn delete(&self, key: &str) -> Result<(), SecretStoreError>;
+
+    /// Batch write. Stores where a write is expensive override this.
+    fn set_many(&self, entries: &HashMap<String, String>) -> Result<(), SecretStoreError> {
+        for (key, value) in entries {
+            self.set(key, value)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
