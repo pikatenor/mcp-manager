@@ -205,6 +205,27 @@ fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
                 .into()
         };
         form = form.push(field("Bearer", bearer_field));
+
+        // Client identity is config, not token state: keep it editable even
+        // when the bearer is OAuth-managed so a mis-registered client can be
+        // fixed without disconnecting first.
+        form = form.push(field(
+            "OAuth client ID",
+            text_input(
+                "optional pre-registered client id",
+                &app.oauth_client_id,
+            )
+            .on_input(Message::OauthClientId),
+        ));
+        form = form.push(field(
+            "OAuth client secret",
+            text_input(
+                "blank keeps the stored secret",
+                &app.oauth_client_secret,
+            )
+            .secure(true)
+            .on_input(Message::OauthClientSecret),
+        ));
     }
 
     form = form.push(
