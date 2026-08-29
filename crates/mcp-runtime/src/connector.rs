@@ -12,7 +12,7 @@ use mcp_core::{
 use mcp_platform::SecretStore;
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
 use rmcp::service::{RoleClient, RunningService};
-use rmcp::transport::auth::{AuthError, AuthorizationManager};
+use rmcp::transport::auth::{AuthError, AuthorizationManager, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
     SseError, StreamableHttpError, StreamableHttpPostResponse, StreamableHttpClient,
@@ -25,7 +25,7 @@ use sse_stream::Sse;
 use tokio::process::Command;
 use tokio::sync::Mutex;
 
-use crate::oauth::KeychainCredentialStore;
+use crate::oauth::{pre_registered_client, KeychainCredentialStore};
 
 /// Connects to local stdio, remote Streamable HTTP, or legacy HTTP+SSE servers.
 /// stdio and Streamable HTTP ride on rmcp; the deprecated HTTP+SSE transport
@@ -164,11 +164,28 @@ async fn oauth_manager(
     let mut manager = AuthorizationManager::new(url.to_string())
         .await
         .map_err(|err| RegistryError::Backend(err.to_string()))?;
-    manager.set_credential_store(KeychainCredentialStore::new(store, server_id));
+    manager.set_credential_store(KeychainCredentialStore::new(store.clone(), server_id));
     let initialized = manager
         .initialize_from_store()
         .await
         .map_err(|err| RegistryError::Backend(err.to_string()))?;
+    // `initialize_from_store` restores only the client id (as a public
+    // client). Re-arm a stored secret so confidential refreshes carry client
+    // auth; the redirect URI is irrelevant on this path and mirrors rmcp's
+    // own placeholder (the base URL). Id-only clients skip this: the restore
+    // is already equivalent.
+    if initialized {
+        if let Ok(Some(client)) = pre_registered_client(store.as_ref(), server_id) {
+            if let Some(secret) = client.client_secret {
+                manager
+                    .configure_client(
+                        OAuthClientConfig::new(client.client_id, url.to_string())
+                            .with_client_secret(secret),
+                    )
+                    .map_err(|err| RegistryError::Backend(err.to_string()))?;
+            }
+        }
+    }
     Ok(initialized.then(|| Arc::new(manager)))
 }
 
