@@ -30,6 +30,8 @@ pub enum TokenError {
     Revoked,
     #[error("unknown token id")]
     UnknownId,
+    #[error("token is not revoked")]
+    NotRevoked,
 }
 
 #[derive(Default)]
@@ -108,6 +110,41 @@ impl TokenService {
     pub fn list(&self) -> Vec<TokenRecord> {
         self.records.clone()
     }
+
+    /// Removes a revoked record entirely. Active tokens must be revoked first
+    /// so a stray delete cannot silently destroy a live credential's record.
+    pub fn delete(&mut self, id: &str) -> Result<(), TokenError> {
+        let index = self
+            .records
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or(TokenError::UnknownId)?;
+        if self.records[index].revoked_at.is_none() {
+            return Err(TokenError::NotRevoked);
+        }
+        self.records.remove(index);
+        if let Some(db) = &self.db {
+            persist_delete(db, id);
+        }
+        Ok(())
+    }
+
+    /// Removes every revoked record, returning how many were dropped.
+    pub fn clear_revoked(&mut self) -> usize {
+        let removed: Vec<String> = self
+            .records
+            .iter()
+            .filter(|r| r.revoked_at.is_some())
+            .map(|r| r.id.clone())
+            .collect();
+        self.records.retain(|r| r.revoked_at.is_none());
+        if let Some(db) = &self.db {
+            for id in &removed {
+                persist_delete(db, id);
+            }
+        }
+        removed.len()
+    }
 }
 
 pub fn hash_token(plaintext: &str) -> String {
@@ -136,6 +173,12 @@ fn persist_revoke(db: &Arc<Mutex<Connection>>, record: &TokenRecord) {
             "UPDATE tokens SET revoked_at = ?1 WHERE id = ?2",
             rusqlite::params![record.revoked_at, record.id],
         );
+    }
+}
+
+fn persist_delete(db: &Arc<Mutex<Connection>>, id: &str) {
+    if let Ok(conn) = db.lock() {
+        let _ = conn.execute("DELETE FROM tokens WHERE id = ?1", rusqlite::params![id]);
     }
 }
 
@@ -194,6 +237,48 @@ mod tests {
     fn revoke_unknown_id_errors() {
         let mut svc = TokenService::new();
         assert_eq!(svc.revoke("missing"), Err(TokenError::UnknownId));
+    }
+
+    #[test]
+    fn delete_removes_revoked_record_only() {
+        let mut svc = TokenService::new();
+        let revoked = svc.issue("cursor");
+        let active = svc.issue("claude");
+        svc.revoke(&revoked.id).unwrap();
+        svc.delete(&revoked.id).unwrap();
+        let listed = svc.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, active.id);
+        // Gone from the store entirely, not merely revoked.
+        assert_eq!(svc.validate(&revoked.plaintext), Err(TokenError::Invalid));
+    }
+
+    #[test]
+    fn delete_refuses_active_token() {
+        let mut svc = TokenService::new();
+        let issued = svc.issue("cursor");
+        assert_eq!(svc.delete(&issued.id), Err(TokenError::NotRevoked));
+        assert_eq!(svc.list().len(), 1);
+    }
+
+    #[test]
+    fn delete_unknown_id_errors() {
+        let mut svc = TokenService::new();
+        assert_eq!(svc.delete("missing"), Err(TokenError::UnknownId));
+    }
+
+    #[test]
+    fn clear_revoked_removes_every_revoked_record() {
+        let mut svc = TokenService::new();
+        let a = svc.issue("cursor");
+        let b = svc.issue("claude");
+        let c = svc.issue("probe");
+        svc.revoke(&a.id).unwrap();
+        svc.revoke(&c.id).unwrap();
+        assert_eq!(svc.clear_revoked(), 2);
+        let listed = svc.list();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, b.id);
     }
 
     #[test]

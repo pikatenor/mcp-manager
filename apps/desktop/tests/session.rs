@@ -225,6 +225,32 @@ fn revoke_token_marks_record() {
     assert!(listed[0].revoked_at.is_some());
 }
 
+#[test]
+fn delete_token_removes_only_revoked_record() {
+    let fx = session(vec![]);
+    let revoked = fx.session.issue_token("cursor").unwrap();
+    let active = fx.session.issue_token("claude").unwrap();
+    fx.session.revoke_token(&revoked.id).unwrap();
+    fx.session.delete_token(&revoked.id).unwrap();
+    let listed = fx.session.list_tokens().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, active.id);
+}
+
+#[test]
+fn clear_revoked_tokens_reports_count() {
+    let fx = session(vec![]);
+    let a = fx.session.issue_token("cursor").unwrap();
+    let b = fx.session.issue_token("claude").unwrap();
+    let c = fx.session.issue_token("probe").unwrap();
+    fx.session.revoke_token(&a.id).unwrap();
+    fx.session.revoke_token(&c.id).unwrap();
+    assert_eq!(fx.session.clear_revoked_tokens().unwrap(), 2);
+    let listed = fx.session.list_tokens().unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, b.id);
+}
+
 #[tokio::test]
 async fn add_server_requires_name() {
     let fx = session(vec![]);

@@ -307,6 +307,20 @@ impl Session {
             .map_err(|e| e.to_string())
     }
 
+    /// Removes a revoked token record entirely; active tokens refuse deletion.
+    pub fn delete_token(&self, id: &str) -> Result<(), String> {
+        self.tokens
+            .lock()
+            .map_err(|e| e.to_string())?
+            .delete(id)
+            .map_err(|e| e.to_string())
+    }
+
+    /// Removes every revoked record, returning how many were dropped.
+    pub fn clear_revoked_tokens(&self) -> Result<usize, String> {
+        Ok(self.tokens.lock().map_err(|e| e.to_string())?.clear_revoked())
+    }
+
     pub async fn list_servers(&self) -> Result<Vec<ServerState>, String> {
         self.registry.lock().await.list().map_err(|e| e.to_string())
     }
