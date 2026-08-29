@@ -21,7 +21,9 @@ This file is the working contract for agents in this repo. Product overview and 
 
 Public tool names are `{serverName}__{toolName}` (`TOOL_DELIMITER`). Missing/`true` in `tool_permissions` is public; `false` hides and blocks.
 
-Secrets: env values, bearer, OAuth tokens → keychain via `server_env_key` / `server_bearer_key` / `server_oauth_key`. SQLite stores key *names* only. Remote URLs: https anywhere, http only to localhost; refuse link-local and `metadata.google.internal` (`validate_remote_url`).
+Secrets: env values, bearer, OAuth tokens → keychain via `server_env_key` / `server_bearer_key` / `server_oauth_key`. All of a server's keys (see `server_secret_keys` in `apps/desktop/src/session.rs`) live folded into ONE keychain item — a versioned JSON bundle under account `secrets` (`BundleSecretStore`) — so a binary update costs at most one re-authorization prompt. A pre-bundle binary's per-key items are folded in at startup, before auto-start. Unknown bundle versions and unreadable bundles fail closed; never widen that to a wipe. SQLite stores key *names* only. Remote URLs: https anywhere, http only to localhost; refuse link-local and `metadata.google.internal` (`validate_remote_url`).
+
+One-time update jobs: register an idempotent `Migration` in `desktop_migrations` (`apps/desktop/src/app.rs`). The `migrations.db` ledger (`mcp-core`) marks a job only after success, so a failed job retries on the next launch without blocking later jobs. Jobs run before auto-start.
 
 OAuth loopback must stay on `http://127.0.0.1:<ephemeral>/oauth/callback`. After a successful flow, persist access token as the server bearer so `McpConnector` can use it.
 

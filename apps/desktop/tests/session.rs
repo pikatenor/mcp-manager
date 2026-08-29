@@ -10,7 +10,7 @@ use mcp_manager::session::{parse_env, AddServerRequest, ImportOutcome, Session};
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_client_id_key,
     server_oauth_client_secret_key, server_oauth_key, BrowserError, BrowserOpener,
-    MemorySecretStore, SecretStore,
+    BundleSecretStore, MemorySecretStore, SecretStore, SecretStoreError,
 };
 
 struct StaticBackend {
@@ -363,6 +363,28 @@ async fn delete_server_removes_secrets() {
         None
     );
     assert!(fx.session.list_servers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn delete_server_removes_oauth_token_and_credential_keys() {
+    let fx = session(vec![]);
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    let keys = [
+        (server_oauth_key(&config.id, "access_token"), "at"),
+        (server_oauth_key(&config.id, "refresh_token"), "rt"),
+        (server_oauth_key(&config.id, "credentials"), "blob"),
+    ];
+    for (key, value) in &keys {
+        fx.secrets.set(key, value).unwrap();
+    }
+    assert!(fx.session.delete_server(&config.id).await.unwrap());
+    for (key, _) in &keys {
+        assert_eq!(fx.secrets.get(key).unwrap(), None, "{key}");
+    }
 }
 
 #[tokio::test]
@@ -991,4 +1013,209 @@ fn clear_tool_calls_removes_entries() {
         .record("docs", "search", "cursor", true, None, 1);
     fx.session.clear_tool_calls().unwrap();
     assert!(fx.session.list_tool_calls(10).unwrap().is_empty());
+}
+
+struct MigrationFixture {
+    session: Session,
+    store: Arc<BundleSecretStore>,
+    legacy: Arc<MemorySecretStore>,
+    _dir: tempfile::TempDir,
+}
+
+fn migration_session() -> MigrationFixture {
+    let dir = tempfile::tempdir().unwrap();
+    let memory = Arc::new(MemorySecretStore::new());
+    let store = Arc::new(BundleSecretStore::new(memory));
+    let session = Session::open(
+        dir.path(),
+        Arc::new(RecordingConnector { tools: vec![] }),
+        store.clone(),
+        Arc::new(NoopBrowser),
+    )
+    .unwrap();
+    MigrationFixture {
+        session,
+        store,
+        legacy: Arc::new(MemorySecretStore::new()),
+        _dir: dir,
+    }
+}
+
+/// Legacy store whose `get` fails for one chosen key, mimicking a denied
+/// keychain ACL prompt on a single item.
+struct PartiallyFailingStore {
+    inner: MemorySecretStore,
+    fail_key: String,
+}
+
+impl SecretStore for PartiallyFailingStore {
+    fn set(&self, key: &str, value: &str) -> Result<(), SecretStoreError> {
+        self.inner.set(key, value)
+    }
+
+    fn get(&self, key: &str) -> Result<Option<String>, SecretStoreError> {
+        if key == self.fail_key {
+            return Err(SecretStoreError::Operation(format!("denied: {key}")));
+        }
+        self.inner.get(key)
+    }
+
+    fn delete(&self, key: &str) -> Result<(), SecretStoreError> {
+        self.inner.delete(key)
+    }
+}
+
+/// Store that refuses writes, standing in for a locked or unreadable bundle.
+struct RejectingStore;
+
+impl SecretStore for RejectingStore {
+    fn set(&self, _key: &str, _value: &str) -> Result<(), SecretStoreError> {
+        Err(SecretStoreError::Operation("writes rejected".into()))
+    }
+
+    fn get(&self, _key: &str) -> Result<Option<String>, SecretStoreError> {
+        Ok(None)
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), SecretStoreError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn migrate_legacy_secrets_moves_every_key_kind_into_the_session_store() {
+    let fx = migration_session();
+    let mut local = local_add("everything");
+    local.env.insert("API_TOKEN".into(), "sk-session".into());
+    let local = fx.session.add_server(local).await.unwrap();
+    let mut remote = remote_add("remote");
+    remote.oauth_client_id = Some("cid-session".into());
+    let remote = fx.session.add_server(remote).await.unwrap();
+
+    let keys = HashMap::from([
+        (
+            server_env_key(&local.id, "API_TOKEN"),
+            "sk-legacy".to_string(),
+        ),
+        (server_bearer_key(&local.id), "tok-legacy".to_string()),
+        (
+            server_oauth_client_id_key(&remote.id),
+            "cid-legacy".to_string(),
+        ),
+        (
+            server_oauth_client_secret_key(&remote.id),
+            "sec-legacy".to_string(),
+        ),
+        (
+            server_oauth_key(&remote.id, "access_token"),
+            "at-legacy".to_string(),
+        ),
+        (
+            server_oauth_key(&remote.id, "refresh_token"),
+            "rt-legacy".to_string(),
+        ),
+        (
+            server_oauth_key(&remote.id, "credentials"),
+            "blob-legacy".to_string(),
+        ),
+    ]);
+    for (key, value) in &keys {
+        fx.legacy.set(key, value).unwrap();
+    }
+
+    fx.session
+        .migrate_legacy_secrets(fx.legacy.as_ref())
+        .await
+        .unwrap();
+
+    for (key, expected) in &keys {
+        assert_eq!(
+            fx.store.get(key).unwrap().as_deref(),
+            Some(expected.as_str()),
+            "{key}"
+        );
+    }
+    for key in keys.keys() {
+        assert_eq!(fx.legacy.get(key).unwrap(), None, "{key}");
+    }
+}
+
+#[tokio::test]
+async fn migrate_legacy_secrets_is_idempotent() {
+    let fx = migration_session();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    let key = server_bearer_key(&config.id);
+    fx.legacy.set(&key, "tok").unwrap();
+
+    fx.session
+        .migrate_legacy_secrets(fx.legacy.as_ref())
+        .await
+        .unwrap();
+    // A second run finds no legacy items left and changes nothing.
+    fx.session
+        .migrate_legacy_secrets(fx.legacy.as_ref())
+        .await
+        .unwrap();
+    assert_eq!(fx.store.get(&key).unwrap().as_deref(), Some("tok"));
+    assert_eq!(fx.legacy.get(&key).unwrap(), None);
+}
+
+#[tokio::test]
+async fn migrate_legacy_secrets_aborts_when_a_legacy_read_fails() {
+    let fx = migration_session();
+    let mut request = local_add("everything");
+    // The env name must be registered, or the migration can never enumerate
+    // its key to read it.
+    request.env.insert("API_TOKEN".into(), "sk-session".into());
+    let config = fx.session.add_server(request).await.unwrap();
+    let good = server_bearer_key(&config.id);
+    let bad = server_env_key(&config.id, "API_TOKEN");
+    let legacy = PartiallyFailingStore {
+        inner: MemorySecretStore::new(),
+        fail_key: bad.clone(),
+    };
+    legacy.set(&good, "tok").unwrap();
+    legacy.set(&bad, "sk").unwrap();
+
+    let error = fx
+        .session
+        .migrate_legacy_secrets(&legacy)
+        .await
+        .unwrap_err();
+    assert!(error.contains(&bad), "{error}");
+    // Nothing moved: the whole run retries on the next launch.
+    assert_eq!(fx.store.get(&good).unwrap(), None);
+    assert_eq!(legacy.get(&good).unwrap().as_deref(), Some("tok"));
+    // Read around the injected failure to confirm the item is still there.
+    assert_eq!(legacy.inner.get(&bad).unwrap().as_deref(), Some("sk"));
+}
+
+#[tokio::test]
+async fn migrate_legacy_secrets_keeps_legacy_when_the_bundle_write_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let session = Session::open(
+        dir.path(),
+        Arc::new(RecordingConnector { tools: vec![] }),
+        Arc::new(RejectingStore),
+        Arc::new(NoopBrowser),
+    )
+    .unwrap();
+    // No secrets on the request, so the add itself never writes.
+    let config = session.add_server(local_add("everything")).await.unwrap();
+    let key = server_bearer_key(&config.id);
+    let legacy = Arc::new(MemorySecretStore::new());
+    legacy.set(&key, "tok").unwrap();
+
+    assert!(
+        session
+            .migrate_legacy_secrets(legacy.as_ref())
+            .await
+            .is_err()
+    );
+    // The legacy item survives so the next launch can retry the move.
+    assert_eq!(legacy.get(&key).unwrap().as_deref(), Some("tok"));
 }
