@@ -93,4 +93,23 @@ mod tests {
             Err(crate::TokenError::Revoked)
         );
     }
+
+    #[test]
+    fn sqlite_delete_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tokens.db");
+        let issued = {
+            let mut svc = TokenService::open_sqlite(&path).unwrap();
+            let issued = svc.issue("cursor");
+            svc.revoke(&issued.id).unwrap();
+            svc.delete(&issued.id).unwrap();
+            issued
+        };
+        let svc = TokenService::open_sqlite(&path).unwrap();
+        assert_eq!(
+            svc.validate(&issued.plaintext),
+            Err(crate::TokenError::Invalid)
+        );
+        assert!(svc.list().is_empty());
+    }
 }
