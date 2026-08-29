@@ -72,4 +72,25 @@ mod tests {
         assert_eq!(store.get(&key).unwrap(), None);
         store.delete(&key).unwrap();
     }
+
+    #[test]
+    fn set_many_default_writes_all_keys() {
+        let store = MemorySecretStore::new();
+        let entries = HashMap::from([
+            (server_bearer_key("srv1"), "tok".to_string()),
+            (server_env_key("srv1", "API_TOKEN"), "sk".to_string()),
+        ]);
+        store.set_many(&entries).unwrap();
+        assert_eq!(
+            store.get(&server_bearer_key("srv1")).unwrap().as_deref(),
+            Some("tok")
+        );
+        assert_eq!(
+            store
+                .get(&server_env_key("srv1", "API_TOKEN"))
+                .unwrap()
+                .as_deref(),
+            Some("sk")
+        );
+    }
 }
