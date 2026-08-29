@@ -25,3 +25,13 @@ pub fn server_bearer_key(server_id: &str) -> String {
 pub fn server_oauth_key(server_id: &str, field: &str) -> String {
     format!("server:{server_id}:oauth:{field}")
 }
+
+/// Pre-registered OAuth client identity configured by the user, not minted by
+/// a registration flow.
+pub fn server_oauth_client_id_key(server_id: &str) -> String {
+    server_oauth_key(server_id, "client_id")
+}
+
+pub fn server_oauth_client_secret_key(server_id: &str) -> String {
+    server_oauth_key(server_id, "client_secret")
+}

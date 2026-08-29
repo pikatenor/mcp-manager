@@ -6,7 +6,10 @@ use axum::extract::Query;
 use axum::routing::get;
 use axum::Router;
 use mcp_core::validate_remote_url;
-use mcp_platform::{server_bearer_key, server_oauth_key, BrowserOpener, SecretStore};
+use mcp_platform::{
+    server_bearer_key, server_oauth_client_id_key, server_oauth_client_secret_key,
+    server_oauth_key, BrowserOpener, SecretStore,
+};
 use oauth2::TokenResponse;
 use rmcp::transport::auth::{
     AuthError, AuthorizationManager, AuthorizationRequest, AuthorizationSession, CredentialStore,
@@ -91,17 +94,47 @@ impl CredentialStore for KeychainCredentialStore {
     }
 
     async fn clear(&self) -> Result<(), AuthError> {
+        // Only flow-derived state is deleted here. The static client identity
+        // keys are user config and must survive (rmcp calls `clear` on issuer
+        // change); the secret values are removed by the UI's delete flow.
         for key in [
             self.blob_key(),
             server_bearer_key(&self.server_id),
             server_oauth_key(&self.server_id, "access_token"),
             server_oauth_key(&self.server_id, "refresh_token"),
-            server_oauth_key(&self.server_id, "client_id"),
         ] {
             self.secrets.delete(&key).map_err(store_error)?;
         }
         Ok(())
     }
+}
+
+/// A pre-registered OAuth client identity configured by the user out of band.
+pub(crate) struct PreRegisteredClient {
+    pub(crate) client_id: String,
+    pub(crate) client_secret: Option<String>,
+}
+
+/// Reads the server's static client identity from the keychain. `None` when no
+/// client id is configured; an orphaned secret without an id is ignored rather
+/// than forwarded to rmcp (which rejects a secret without an id).
+pub(crate) fn pre_registered_client(
+    secrets: &dyn SecretStore,
+    server_id: &str,
+) -> Result<Option<PreRegisteredClient>, mcp_platform::SecretStoreError> {
+    let Some(client_id) = secrets
+        .get(&server_oauth_client_id_key(server_id))?
+        .filter(|id| !id.is_empty())
+    else {
+        return Ok(None);
+    };
+    let client_secret = secrets
+        .get(&server_oauth_client_secret_key(server_id))?
+        .filter(|secret| !secret.is_empty());
+    Ok(Some(PreRegisteredClient {
+        client_id,
+        client_secret,
+    }))
 }
 
 pub struct OAuthFlow {
@@ -124,6 +157,11 @@ impl OAuthFlow {
 
     pub async fn authorize(&self, server_id: &str, mcp_url: &str) -> Result<(), OAuthError> {
         let mcp_url = validate_remote_url(mcp_url)?;
+        // A user-configured client identity replaces dynamic registration for
+        // authorization servers that don't offer it; read it up front so the
+        // whole flow (authorize redirect, code exchange) runs as that client.
+        let pre_registered = pre_registered_client(self.secrets.as_ref(), server_id)
+            .map_err(|err| OAuthError::Failed(err.to_string()))?;
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .map_err(|err| OAuthError::Failed(err.to_string()))?;
@@ -169,12 +207,16 @@ impl OAuthFlow {
         let resolution = manager.resolve_metadata().await.map_err(auth_error)?;
         manager.set_metadata(resolution.metadata);
 
-        let session = AuthorizationSession::new(
-            manager,
-            AuthorizationRequest::new(redirect_uri).with_client_name("mcp-manager"),
-        )
-        .await
-        .map_err(|(_, error)| auth_error(error))?;
+        let mut request = AuthorizationRequest::new(redirect_uri).with_client_name("mcp-manager");
+        if let Some(client) = pre_registered {
+            request = request.with_preregistered_client(client.client_id);
+            if let Some(secret) = client.client_secret {
+                request = request.with_client_secret(secret);
+            }
+        }
+        let session = AuthorizationSession::new(manager, request)
+            .await
+            .map_err(|(_, error)| auth_error(error))?;
         self.browser
             .open_url(session.get_authorization_url())
             .map_err(|err| OAuthError::Failed(err.to_string()))?;
