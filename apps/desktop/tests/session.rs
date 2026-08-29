@@ -723,3 +723,51 @@ fn import_outcome_summary_lists_counts() {
     let empty = ImportOutcome::default();
     assert!(empty.summary().contains("No servers"));
 }
+
+#[test]
+fn session_open_creates_calls_db() {
+    let fx = session(vec![]);
+    assert!(fx._dir.path().join("calls.db").exists());
+}
+
+#[test]
+fn session_records_and_lists_tool_calls() {
+    let fx = session(vec![]);
+    fx.session
+        .call_log()
+        .record("docs", "search", "cursor", true, None, 12);
+    let rows = fx.session.list_tool_calls(10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].server, "docs");
+    assert_eq!(rows[0].tool, "search");
+    assert_eq!(rows[0].client, "cursor");
+    assert!(rows[0].ok);
+    assert_eq!(rows[0].error_kind, None);
+    assert_eq!(rows[0].duration_ms, 12);
+    assert!(rows[0].called_at > 0);
+}
+
+#[test]
+fn list_tool_calls_orders_newest_first() {
+    let fx = session(vec![]);
+    fx.session
+        .call_log()
+        .record("docs", "search", "cursor", true, None, 1);
+    fx.session
+        .call_log()
+        .record("github", "issues", "claude", false, Some("backend_error"), 2);
+    let rows = fx.session.list_tool_calls(10).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].tool, "issues");
+    assert_eq!(rows[1].tool, "search");
+}
+
+#[test]
+fn clear_tool_calls_removes_entries() {
+    let fx = session(vec![]);
+    fx.session
+        .call_log()
+        .record("docs", "search", "cursor", true, None, 1);
+    fx.session.clear_tool_calls().unwrap();
+    assert!(fx.session.list_tool_calls(10).unwrap().is_empty());
+}

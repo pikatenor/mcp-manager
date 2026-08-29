@@ -4,8 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_core::{
-    is_tool_public, Aggregator, BackendConnector, ImportedServer, IssuedToken, ServerConfig,
-    ServerRegistry, ServerState, ServerStatus, ServerType, TokenRecord, TokenService,
+    is_tool_public, Aggregator, BackendConnector, CallLog, ImportedServer, IssuedToken,
+    ServerConfig, ServerRegistry, ServerState, ServerStatus, ServerType, TokenRecord, TokenService,
+    ToolCallEntry,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_key, BrowserOpener, SecretStore,
@@ -19,6 +20,7 @@ pub struct Session {
     tokens: Arc<Mutex<TokenService>>,
     registry: Arc<AsyncMutex<ServerRegistry>>,
     aggregator: Arc<AsyncMutex<Aggregator>>,
+    call_log: Arc<CallLog>,
     secrets: Arc<dyn SecretStore>,
     browser: Arc<dyn BrowserOpener>,
 }
@@ -179,10 +181,13 @@ impl Session {
         let registry = ServerRegistry::open_sqlite(&data_dir.join("state.db"), connector)
             .map_err(|e| e.to_string())?;
         let aggregator = registry.aggregator();
+        let call_log =
+            CallLog::open_sqlite(&data_dir.join("calls.db")).map_err(|e| e.to_string())?;
         Ok(Self {
             tokens: Arc::new(Mutex::new(tokens)),
             registry: Arc::new(AsyncMutex::new(registry)),
             aggregator,
+            call_log: Arc::new(call_log),
             secrets,
             browser,
         })
@@ -194,6 +199,20 @@ impl Session {
 
     pub fn aggregator(&self) -> Arc<AsyncMutex<Aggregator>> {
         self.aggregator.clone()
+    }
+
+    /// The same call log the HTTP server records into.
+    pub fn call_log(&self) -> Arc<CallLog> {
+        self.call_log.clone()
+    }
+
+    pub fn list_tool_calls(&self, limit: usize) -> Result<Vec<ToolCallEntry>, String> {
+        self.call_log.list_recent(limit).map_err(|e| e.to_string())
+    }
+
+    pub fn clear_tool_calls(&self) -> Result<(), String> {
+        self.call_log.clear();
+        Ok(())
     }
 
     pub fn aggregator_endpoint() -> String {
