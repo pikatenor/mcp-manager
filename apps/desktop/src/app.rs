@@ -106,6 +106,8 @@ pub(crate) struct FormInput<'a> {
     pub remote_url: &'a str,
     pub env_text: String,
     pub bearer: &'a str,
+    pub oauth_client_id: &'a str,
+    pub oauth_client_secret: &'a str,
     pub auto_start: bool,
 }
 
@@ -137,10 +139,17 @@ pub(crate) fn add_request_from_form(input: FormInput<'_>) -> AddServerRequest {
         } else {
             Some(input.bearer.to_string())
         },
-        // The form gains OAuth client fields in the UI wiring; the session
-        // layer already persists them.
-        oauth_client_id: None,
-        oauth_client_secret: None,
+        // OAuth only applies to remote servers; blank means "no config".
+        oauth_client_id: if !local && !input.oauth_client_id.is_empty() {
+            Some(input.oauth_client_id.to_string())
+        } else {
+            None
+        },
+        oauth_client_secret: if !local && !input.oauth_client_secret.is_empty() {
+            Some(input.oauth_client_secret.to_string())
+        } else {
+            None
+        },
     }
 }
 
@@ -155,6 +164,7 @@ pub(crate) struct EditFormState {
     pub remote_url: String,
     pub env_text: String,
     pub bearer: String,
+    pub oauth_client_id: String,
     pub auto_start: bool,
 }
 
@@ -171,6 +181,8 @@ mod tests {
             remote_url: "https://example.com/mcp",
             env_text: "API_TOKEN=sk-1".to_string(),
             bearer: "",
+            oauth_client_id: "",
+            oauth_client_secret: "",
             auto_start: true,
         }
     }
@@ -205,6 +217,30 @@ mod tests {
         );
         assert_eq!(request.bearer, None);
     }
+
+    #[test]
+    fn add_request_from_form_maps_oauth_client_fields() {
+        let mut remote_input = input(FormServerType::RemoteStreamable);
+        remote_input.oauth_client_id = "cid-static";
+        remote_input.oauth_client_secret = "sec-static";
+        let request = add_request_from_form(remote_input);
+        assert_eq!(request.oauth_client_id.as_deref(), Some("cid-static"));
+        assert_eq!(request.oauth_client_secret.as_deref(), Some("sec-static"));
+
+        // Blank fields mean no client config: an empty id clears on update
+        // and an empty secret keeps the stored one.
+        let request = add_request_from_form(input(FormServerType::RemoteStreamable));
+        assert_eq!(request.oauth_client_id, None);
+        assert_eq!(request.oauth_client_secret, None);
+
+        // Local servers never carry OAuth client config.
+        let mut local_input = input(FormServerType::Local);
+        local_input.oauth_client_id = "cid-static";
+        local_input.oauth_client_secret = "sec-static";
+        let request = add_request_from_form(local_input);
+        assert_eq!(request.oauth_client_id, None);
+        assert_eq!(request.oauth_client_secret, None);
+    }
 }
 
 pub(crate) struct App {
@@ -231,6 +267,8 @@ pub(crate) struct App {
     pub(crate) remote_url: String,
     pub(crate) env: text_editor::Content,
     pub(crate) bearer: String,
+    pub(crate) oauth_client_id: String,
+    pub(crate) oauth_client_secret: String,
     pub(crate) auto_start: bool,
     pub(crate) error: Option<String>,
 }
@@ -268,6 +306,8 @@ pub enum Message {
     RemoteUrl(String),
     Env(text_editor::Action),
     Bearer(String),
+    OauthClientId(String),
+    OauthClientSecret(String),
     AutoStart(bool),
     AddServer,
     Start(String),
@@ -372,6 +412,8 @@ impl App {
             remote_url: String::new(),
             env: text_editor::Content::new(),
             bearer: String::new(),
+            oauth_client_id: String::new(),
+            oauth_client_secret: String::new(),
             auto_start: true,
             error: None,
         };
@@ -445,6 +487,8 @@ impl App {
         self.remote_url.clear();
         self.env = text_editor::Content::new();
         self.bearer.clear();
+        self.oauth_client_id.clear();
+        self.oauth_client_secret.clear();
         self.auto_start = true;
     }
 
@@ -457,6 +501,8 @@ impl App {
             remote_url: &self.remote_url,
             env_text: self.env.text(),
             bearer: &self.bearer,
+            oauth_client_id: &self.oauth_client_id,
+            oauth_client_secret: &self.oauth_client_secret,
             auto_start: self.auto_start,
         }
     }
@@ -579,6 +625,7 @@ impl App {
                             remote_url: config.remote_url.unwrap_or_default(),
                             env_text: lines.join("\n"),
                             bearer: values.bearer.unwrap_or_default(),
+                            oauth_client_id: values.oauth_client_id.unwrap_or_default(),
                             auto_start: config.auto_start,
                         })
                     },
@@ -594,6 +641,10 @@ impl App {
                     self.remote_url = form.remote_url;
                     self.env = text_editor::Content::with_text(&form.env_text);
                     self.bearer = form.bearer;
+                    self.oauth_client_id = form.oauth_client_id;
+                    // The stored secret is never read back into the form;
+                    // blank means "keep the stored one" on save.
+                    self.oauth_client_secret = String::new();
                     self.auto_start = form.auto_start;
                     self.editing_id = Some(form.id);
                     self.show_add_form = true;
@@ -677,6 +728,14 @@ impl App {
             }
             Message::Bearer(value) => {
                 self.bearer = value;
+                Task::none()
+            }
+            Message::OauthClientId(value) => {
+                self.oauth_client_id = value;
+                Task::none()
+            }
+            Message::OauthClientSecret(value) => {
+                self.oauth_client_secret = value;
                 Task::none()
             }
             Message::AutoStart(value) => {
