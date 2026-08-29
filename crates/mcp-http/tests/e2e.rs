@@ -2,10 +2,11 @@
 
 use std::sync::{Arc, Mutex};
 
-use mcp_core::TokenService;
-use mcp_http::serve_with_listener;
+use mcp_core::{Aggregator, CallLog, TokenService};
+use mcp_http::{serve_with_listener, serve_with_listener_and_aggregator};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Mutex as AsyncMutex;
 
 async fn spawn_server(tokens: Arc<Mutex<TokenService>>) -> std::net::SocketAddr {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -108,4 +109,45 @@ async fn e2e_revoked_token_is_rejected_over_tcp() {
     )
     .await;
     assert_eq!(status, 401);
+}
+
+#[tokio::test]
+async fn e2e_call_log_records_tools_call_over_tcp() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut tokens = TokenService::new();
+    let issued = tokens.issue("cursor");
+    let call_log = Arc::new(CallLog::open_sqlite(&dir.path().join("calls.db")).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let tokens = Arc::new(Mutex::new(tokens));
+    let aggregator = Arc::new(AsyncMutex::new(Aggregator::new()));
+    tokio::spawn(async move {
+        serve_with_listener_and_aggregator(listener, tokens, aggregator, call_log)
+            .await
+            .unwrap();
+    });
+
+    // No servers registered: the call fails as unknown, and that failure is
+    // what gets recorded with the bearer client's name.
+    let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"docs__search","arguments":{}}}"#;
+    let (status, body) = post_mcp(
+        addr,
+        Some(&format!("Bearer {}", issued.plaintext)),
+        call,
+    )
+    .await;
+    assert_eq!(status, 200);
+    assert!(body.contains("error"), "{body}");
+
+    // Metadata persists in calls.db, readable after reopening the file.
+    let log = CallLog::open_sqlite(&dir.path().join("calls.db")).unwrap();
+    let rows = log.list_recent(10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].server, "docs");
+    assert_eq!(rows[0].tool, "search");
+    assert_eq!(rows[0].client, "cursor");
+    assert!(!rows[0].ok);
+    assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
+    assert!(rows[0].called_at > 0);
+    assert!(rows[0].duration_ms >= 0);
 }
