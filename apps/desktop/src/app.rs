@@ -298,6 +298,9 @@ pub enum Message {
     IssueToken,
     TokenIssued(Result<IssuedToken, String>),
     Revoke(String),
+    DeleteToken(String),
+    ClearRevokedTokens,
+    RevokedCleared(Result<usize, String>),
     RefreshLogs,
     LogsLoaded(Result<Vec<ToolCallEntry>, String>),
     ClearLogs,
@@ -687,6 +690,28 @@ impl App {
                 let session = self.session.clone();
                 Task::perform(async move { session.revoke_token(&id) }, Message::OpDone)
             }
+            Message::DeleteToken(id) => {
+                let session = self.session.clone();
+                Task::perform(async move { session.delete_token(&id) }, Message::OpDone)
+            }
+            Message::ClearRevokedTokens => {
+                let session = self.session.clone();
+                Task::perform(
+                    async move { session.clear_revoked_tokens() },
+                    Message::RevokedCleared,
+                )
+            }
+            Message::RevokedCleared(result) => match result {
+                Ok(count) => {
+                    self.notice = Some(format!("cleared {count} revoked token(s)"));
+                    self.error = None;
+                    self.refresh()
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    Task::none()
+                }
+            },
             Message::RefreshLogs => self.load_logs(),
             Message::LogsLoaded(result) => match result {
                 Ok(rows) => {
