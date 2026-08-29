@@ -27,4 +27,4 @@ url.workspace = true
 axum.workspace = true
 
 [dev-dependencies]
-
+base64.workspace = true
