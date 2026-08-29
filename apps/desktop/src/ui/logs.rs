@@ -12,17 +12,15 @@ use super::styles;
 use super::{card, danger_button, pane_heading, secondary};
 
 pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let mut body = column![pane_heading("Tool calls", app.tool_calls.len())].spacing(16);
+    let heading = row![
+        pane_heading("Tool calls", app.tool_calls.len()),
+        space::horizontal(),
+        danger_button("Clear").on_press(Message::ClearLogs),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center);
 
-    body = body.push(
-        row![
-            secondary("Metadata only \u{2014} arguments and results are never stored."),
-            space::horizontal(),
-            danger_button("Clear").on_press(Message::ClearLogs),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center),
-    );
+    let mut body = column![heading].spacing(16);
 
     if app.tool_calls.is_empty() {
         body = body.push(card(
