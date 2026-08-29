@@ -6,7 +6,7 @@ pub(crate) mod styles;
 pub(crate) mod theme;
 pub(crate) mod tokens;
 
-use iced::widget::{button, container, row, text};
+use iced::widget::{button, container, row, text, text::IntoFragment};
 use iced::{Alignment, Element, Font, Length};
 
 use mcp_core::ServerStatus;
@@ -92,7 +92,9 @@ pub(crate) fn primary_button<'a, M: Clone>(label: &'a str) -> button::Button<'a,
 }
 
 /// Quiet bordered button for routine actions (Copy, Start, Stop, ...).
-pub(crate) fn secondary_button<'a, M: Clone>(label: &'a str) -> button::Button<'a, M> {
+pub(crate) fn secondary_button<'a, M: Clone>(
+    label: impl IntoFragment<'a>,
+) -> button::Button<'a, M> {
     button(text(label).size(13)).padding([8, 14]).style(styles::secondary)
 }
 

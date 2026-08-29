@@ -100,27 +100,36 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 
         if server.status == ServerStatus::Running {
             if let Some(tools) = app.tools_by_server.get(&id) {
-                let mut tool_list = column![].spacing(6);
-                for tool in tools {
-                    let tool_id = id.clone();
-                    let tool_name = tool.name.clone();
-                    tool_list = tool_list.push(
-                        row![
-                            checkbox(tool.public)
-                                .label(tool.name.clone())
-                                .on_toggle(move |public| Message::ToggleTool {
-                                    id: tool_id.clone(),
-                                    name: tool_name.clone(),
-                                    public,
-                                }),
-                            space::horizontal(),
-                            secondary(if tool.public { "public" } else { "hidden" }),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
+                let collapsed = app.tools_collapsed.contains(&id);
+                if !tools.is_empty() {
+                    let label = tools_toggle_label(tools.len(), !collapsed);
+                    content = content.push(
+                        secondary_button(label).on_press(Message::ToggleToolList(id.clone())),
                     );
                 }
-                content = content.push(tool_list);
+                if !collapsed {
+                    let mut tool_list = column![].spacing(6);
+                    for tool in tools {
+                        let tool_id = id.clone();
+                        let tool_name = tool.name.clone();
+                        tool_list = tool_list.push(
+                            row![
+                                checkbox(tool.public)
+                                    .label(tool.name.clone())
+                                    .on_toggle(move |public| Message::ToggleTool {
+                                        id: tool_id.clone(),
+                                        name: tool_name.clone(),
+                                        public,
+                                    }),
+                                space::horizontal(),
+                                secondary(if tool.public { "public" } else { "hidden" }),
+                            ]
+                            .spacing(8)
+                            .align_y(Alignment::Center),
+                        );
+                    }
+                    content = content.push(tool_list);
+                }
             }
         }
 
@@ -269,4 +278,31 @@ fn import_form(app: &App) -> iced::widget::Column<'_, Message> {
         ]
         .spacing(8),
     )
+}
+
+/// Label for the collapsible tools section: tool count plus an expand chevron.
+fn tools_toggle_label(count: usize, expanded: bool) -> String {
+    let noun = if count == 1 { "tool" } else { "tools" };
+    let chevron = if expanded { "\u{25BE}" } else { "\u{25B8}" };
+    format!("{count} {noun} {chevron}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_toggle_label_counts_tools_with_a_down_chevron_when_expanded() {
+        assert_eq!(tools_toggle_label(3, true), "3 tools ▾");
+    }
+
+    #[test]
+    fn tools_toggle_label_keeps_one_tool_singular() {
+        assert_eq!(tools_toggle_label(1, true), "1 tool ▾");
+    }
+
+    #[test]
+    fn tools_toggle_label_points_right_when_collapsed() {
+        assert_eq!(tools_toggle_label(3, false), "3 tools ▸");
+    }
 }
