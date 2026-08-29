@@ -2558,6 +2558,7 @@ name = "mcp-manager"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "iced",
  "image",
  "mcp-core",

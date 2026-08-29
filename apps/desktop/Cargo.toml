@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 iced = { version = "0.14", features = ["tokio"] }
+chrono.workspace = true
 mcp-core.workspace = true
 mcp-http.workspace = true
 mcp-platform.workspace = true

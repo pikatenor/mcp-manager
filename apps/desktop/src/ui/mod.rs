@@ -1,5 +1,6 @@
 //! View layer for the desktop shell: design tokens, style closures, and panes.
 
+pub(crate) mod logs;
 pub(crate) mod servers;
 pub(crate) mod styles;
 pub(crate) mod theme;

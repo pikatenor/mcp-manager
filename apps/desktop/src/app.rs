@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use iced::widget::{column, container, row, scrollable, space, text, text_editor};
 use iced::{clipboard, window, Alignment, Element, Font, Length, Size, Subscription, Task};
-use mcp_core::{IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord};
+use mcp_core::{IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord, ToolCallEntry};
 use mcp_platform::{AppPaths, NativeAppPaths, NativeBrowserOpener, SecretStore};
 use mcp_runtime::McpConnector;
 
@@ -53,7 +53,11 @@ pub(crate) enum FormServerType {
 pub(crate) enum Section {
     Servers,
     Tokens,
+    Logs,
 }
+
+/// Rows the pane loads; the store retains more behind the call-log cap.
+pub(crate) const LOG_ROWS: usize = 200;
 
 pub(crate) const FORM_SERVER_TYPES: [FormServerType; 3] = [
     FormServerType::Local,
@@ -212,6 +216,7 @@ pub(crate) struct App {
     pub(crate) client_name: String,
     pub(crate) tokens: Vec<TokenRecord>,
     pub(crate) plaintext: Option<String>,
+    pub(crate) tool_calls: Vec<ToolCallEntry>,
     pub(crate) servers: Vec<ServerState>,
     pub(crate) tools_by_server: HashMap<String, Vec<ServerToolView>>,
     pub(crate) oauth_by_server: HashMap<String, bool>,
@@ -249,6 +254,9 @@ pub enum Message {
     IssueToken,
     TokenIssued(Result<IssuedToken, String>),
     Revoke(String),
+    RefreshLogs,
+    LogsLoaded(Result<Vec<ToolCallEntry>, String>),
+    ClearLogs,
     ServerName(String),
     ServerType(FormServerType),
     Command(String),
@@ -349,6 +357,7 @@ impl App {
             client_name: String::from("cursor"),
             tokens: Vec::new(),
             plaintext: None,
+            tool_calls: Vec::new(),
             servers: Vec::new(),
             tools_by_server: HashMap::new(),
             oauth_by_server: HashMap::new(),
@@ -377,6 +386,11 @@ impl App {
     fn refresh(&self) -> Task<Message> {
         let session = self.session.clone();
         Task::perform(load_snapshot(session), Message::Snapshot)
+    }
+
+    fn load_logs(&self) -> Task<Message> {
+        let session = self.session.clone();
+        Task::perform(async move { session.list_tool_calls(LOG_ROWS) }, Message::LogsLoaded)
     }
 
     fn apply_shell(&self, action: ShellAction) -> Task<Message> {
@@ -469,7 +483,11 @@ impl App {
                 .unwrap_or_else(Task::none),
             Message::Navigate(section) => {
                 self.section = section;
-                Task::none()
+                if section == Section::Logs {
+                    self.load_logs()
+                } else {
+                    Task::none()
+                }
             }
             Message::ToggleAddForm => {
                 // Leaving edit mode must not leave stale prefills behind.
@@ -607,6 +625,25 @@ impl App {
                 let session = self.session.clone();
                 Task::perform(async move { session.revoke_token(&id) }, Message::OpDone)
             }
+            Message::RefreshLogs => self.load_logs(),
+            Message::LogsLoaded(result) => match result {
+                Ok(rows) => {
+                    self.tool_calls = rows;
+                    self.error = None;
+                    Task::none()
+                }
+                Err(error) => {
+                    self.error = Some(error);
+                    Task::none()
+                }
+            },
+            Message::ClearLogs => {
+                let session = self.session.clone();
+                Task::perform(async move { session.clear_tool_calls() }, |result| match result {
+                    Ok(()) => Message::RefreshLogs,
+                    Err(error) => Message::OpDone(Err(error)),
+                })
+            }
             Message::ServerName(value) => {
                 self.server_name = value;
                 Task::none()
@@ -735,12 +772,20 @@ impl App {
         String::from("MCP Manager")
     }
 
-    fn subscription(_app: &Self) -> Subscription<Message> {
-        Subscription::batch([
+    fn subscription(app: &Self) -> Subscription<Message> {
+        let mut subscriptions = vec![
             window::close_requests().map(|_| Message::CloseRequested),
             window::close_events().map(Message::WindowClosed),
             iced::time::every(std::time::Duration::from_millis(100)).map(|_| Message::TrayTick),
-        ])
+        ];
+        // Live refresh only while the log pane is visible.
+        if app.section == Section::Logs {
+            subscriptions.push(
+                iced::time::every(std::time::Duration::from_secs(5))
+                    .map(|_| Message::RefreshLogs),
+            );
+        }
+        Subscription::batch(subscriptions)
     }
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
@@ -779,6 +824,11 @@ impl App {
                     "Client tokens",
                     Message::Navigate(Section::Tokens),
                 ),
+                ui::nav_item(
+                    self.section == Section::Logs,
+                    "Tool calls",
+                    Message::Navigate(Section::Logs),
+                ),
             ]
             .spacing(2),
         );
@@ -795,6 +845,7 @@ impl App {
         let pane = match self.section {
             Section::Servers => ui::servers::view(self),
             Section::Tokens => ui::tokens::view(self),
+            Section::Logs => ui::logs::view(self),
         };
 
         let mut body = column![].spacing(16);
