@@ -855,10 +855,19 @@ impl App {
     }
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
+        let loaded_tools: usize = self.tools_by_server.values().map(Vec::len).sum();
         let top_bar = container(
             row![
                 text("MCP Manager").size(15).font(ui::SEMIBOLD),
                 space::horizontal(),
+                container(
+                    text(format!("{loaded_tools} tools loaded"))
+                        .size(12)
+                        .style(|theme| text::Style {
+                            color: Some(ui::theme::of(theme).text_secondary),
+                        }),
+                )
+                .padding([6, 10]),
                 container(
                     text(&self.endpoint).size(12).font(Font::MONOSPACE).style(
                         |theme| text::Style {
