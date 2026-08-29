@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use iced::widget::{column, container, row, scrollable, space, text, text_editor};
 use iced::{clipboard, window, Alignment, Element, Font, Length, Size, Subscription, Task};
-use mcp_core::{IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord};
+use mcp_core::{CallLog, IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord};
 use mcp_platform::{AppPaths, NativeAppPaths, NativeBrowserOpener, SecretStore};
 use mcp_runtime::McpConnector;
 
@@ -328,8 +328,9 @@ impl App {
 
         let tokens = session.tokens();
         let aggregator = session.aggregator();
+        let call_log = Arc::new(CallLog::open_sqlite(&data_dir.join("calls.db")).expect("open call log"));
         let http: Task<Message> = Task::future(async move {
-            if let Err(error) = mcp_http::serve_with_aggregator(tokens, aggregator).await {
+            if let Err(error) = mcp_http::serve_with_aggregator(tokens, aggregator, call_log).await {
                 eprintln!("mcp http server failed: {error}");
             }
         })
