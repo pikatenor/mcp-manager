@@ -9,7 +9,19 @@ use super::styles::{self, CARD_PADDING};
 use super::{card, danger_button, pane_heading, primary_button, secondary, SEMIBOLD};
 
 pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let mut body = column![pane_heading("Client tokens", app.tokens.len())].spacing(16);
+    let mut heading = row![pane_heading("Client tokens", app.tokens.len()), space::horizontal()]
+        .spacing(10)
+        .align_y(Alignment::Center);
+    if app.tokens.iter().any(|token| token.revoked_at.is_some()) {
+        heading = heading.push(
+            danger_button("Clear revoked").on_press(Message::ClearRevokedTokens),
+        );
+    }
+    let mut body = column![heading].spacing(16);
+
+    if let Some(notice) = &app.notice {
+        body = body.push(super::notice_banner(notice));
+    }
 
     body = body.push(card(
         row![
@@ -46,6 +58,9 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 
         if token.revoked_at.is_some() {
             line = line.push(secondary("revoked"));
+            line = line.push(
+                danger_button("Delete").on_press(Message::DeleteToken(token.id.clone())),
+            );
         } else {
             line = line.push(
                 danger_button("Revoke").on_press(Message::Revoke(token.id.clone())),
