@@ -1,33 +1,48 @@
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use axum::body::Body;
-use axum::extract::{Json, State};
+use axum::extract::{Extension, Json, State};
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use mcp_core::{Aggregator, AggregatorError, TokenService};
+use mcp_core::{strip_server_prefix, Aggregator, AggregatorError, CallLog, TokenService};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::auth::extract_bearer;
 
+/// Bearer-derived client identity for the call log; never the token hash.
+#[derive(Clone)]
+pub struct ClientName(pub String);
+
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<Mutex<TokenService>>,
     pub aggregator: Arc<AsyncMutex<Aggregator>>,
+    pub call_log: Arc<CallLog>,
 }
 
 pub fn router(tokens: Arc<Mutex<TokenService>>) -> Router {
-    router_with_aggregator(tokens, Arc::new(AsyncMutex::new(Aggregator::new())))
+    router_with_aggregator(
+        tokens,
+        Arc::new(AsyncMutex::new(Aggregator::new())),
+        Arc::new(CallLog::memory().expect("in-memory call log")),
+    )
 }
 
 pub fn router_with_aggregator(
     tokens: Arc<Mutex<TokenService>>,
     aggregator: Arc<AsyncMutex<Aggregator>>,
+    call_log: Arc<CallLog>,
 ) -> Router {
-    let state = AppState { tokens, aggregator };
+    let state = AppState {
+        tokens,
+        aggregator,
+        call_log,
+    };
     Router::new()
         .route("/mcp", post(mcp_handler))
         .route_layer(from_fn_with_state(state.clone(), require_token))
@@ -35,15 +50,21 @@ pub fn router_with_aggregator(
 }
 
 pub async fn serve(tokens: Arc<Mutex<TokenService>>) -> std::io::Result<()> {
-    serve_with_aggregator(tokens, Arc::new(AsyncMutex::new(Aggregator::new()))).await
+    serve_with_aggregator(
+        tokens,
+        Arc::new(AsyncMutex::new(Aggregator::new())),
+        Arc::new(CallLog::memory().expect("in-memory call log")),
+    )
+    .await
 }
 
 pub async fn serve_with_aggregator(
     tokens: Arc<Mutex<TokenService>>,
     aggregator: Arc<AsyncMutex<Aggregator>>,
+    call_log: Arc<CallLog>,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(mcp_core::DEFAULT_HTTP_BIND).await?;
-    serve_with_listener_and_aggregator(listener, tokens, aggregator).await
+    serve_with_listener_and_aggregator(listener, tokens, aggregator, call_log).await
 }
 
 pub async fn serve_with_listener(
@@ -54,6 +75,7 @@ pub async fn serve_with_listener(
         listener,
         tokens,
         Arc::new(AsyncMutex::new(Aggregator::new())),
+        Arc::new(CallLog::memory().expect("in-memory call log")),
     )
     .await
 }
@@ -62,11 +84,16 @@ pub async fn serve_with_listener_and_aggregator(
     listener: tokio::net::TcpListener,
     tokens: Arc<Mutex<TokenService>>,
     aggregator: Arc<AsyncMutex<Aggregator>>,
+    call_log: Arc<CallLog>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router_with_aggregator(tokens, aggregator)).await
+    axum::serve(listener, router_with_aggregator(tokens, aggregator, call_log)).await
 }
 
-async fn require_token(State(state): State<AppState>, req: Request<Body>, next: Next) -> Response {
+async fn require_token(
+    State(state): State<AppState>,
+    mut req: Request<Body>,
+    next: Next,
+) -> Response {
     let header = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -78,19 +105,19 @@ async fn require_token(State(state): State<AppState>, req: Request<Body>, next: 
         )
             .into_response();
     };
-    let valid = state
+    let record = state
         .tokens
         .lock()
         .ok()
-        .and_then(|svc| svc.validate(&token).ok())
-        .is_some();
-    if !valid {
+        .and_then(|svc| svc.validate(&token).ok());
+    let Some(record) = record else {
         return (
             StatusCode::UNAUTHORIZED,
             axum::Json(serde_json::json!({ "error": "invalid token" })),
         )
             .into_response();
-    }
+    };
+    req.extensions_mut().insert(ClientName(record.client_name));
     next.run(req).await
 }
 
@@ -118,7 +145,21 @@ fn jsonrpc_err(id: Value, code: i64, message: String) -> Response {
         .into_response()
 }
 
-async fn mcp_handler(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+/// Coarse failure category for the call log; raw error strings are not stored.
+fn error_kind_of(err: &AggregatorError) -> &'static str {
+    match err {
+        AggregatorError::UnknownTool(_) => "unknown_tool",
+        AggregatorError::PrivateTool(_) => "private_tool",
+        AggregatorError::Backend(_) => "backend_error",
+    }
+}
+
+async fn mcp_handler(
+    State(state): State<AppState>,
+    // Always present: require_token runs first in the route layer.
+    Extension(client): Extension<ClientName>,
+    Json(body): Json<Value>,
+) -> Response {
     let id = body.get("id").cloned().unwrap_or(Value::Null);
     let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
     let params = body.get("params").cloned().unwrap_or_else(|| json!({}));
@@ -165,8 +206,17 @@ async fn mcp_handler(State(state): State<AppState>, Json(body): Json<Value>) -> 
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let aggregator = state.aggregator.lock().await;
-            match aggregator.call_tool(name, arguments).await {
+            let started = Instant::now();
+            // Scoped block: drop the aggregator guard before the blocking log write.
+            let outcome = {
+                let aggregator = state.aggregator.lock().await;
+                aggregator.call_tool(name, arguments).await
+            };
+            let duration_ms = started.elapsed().as_millis() as i64;
+            let (server, tool) = strip_server_prefix(name).unwrap_or(("", name));
+            let ok = outcome.is_ok();
+            let error_kind = outcome.as_ref().err().map(error_kind_of);
+            let response = match outcome {
                 Ok(value) => jsonrpc_ok(
                     id,
                     json!({
@@ -184,7 +234,11 @@ async fn mcp_handler(State(state): State<AppState>, Json(body): Json<Value>) -> 
                         "isError": true
                     }),
                 ),
-            }
+            };
+            state
+                .call_log
+                .record(server, tool, &client.0, ok, error_kind, duration_ms);
+            response
         }
         "" => jsonrpc_err(id, -32600, "invalid request".into()),
         other => jsonrpc_err(id, -32601, format!("method not found: {other}")),
@@ -196,7 +250,9 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use http_body_util::BodyExt;
-    use mcp_core::{Aggregator, AggregatorError, McpBackend, RegisteredServer, TokenService, Tool};
+    use mcp_core::{
+        Aggregator, AggregatorError, CallLog, McpBackend, RegisteredServer, TokenService, Tool,
+    };
     use serde_json::{json, Value};
     use tower::ServiceExt;
 
@@ -212,6 +268,22 @@ mod tests {
 
         async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AggregatorError> {
             Ok(json!({ "ok": true, "tool": name, "arguments": arguments }))
+        }
+    }
+
+    struct FailingBackend;
+
+    #[async_trait]
+    impl McpBackend for FailingBackend {
+        async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+            Ok(vec![Tool {
+                name: "boom".into(),
+                description: None,
+            }])
+        }
+
+        async fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, AggregatorError> {
+            Err(AggregatorError::Backend("upstream refused".into()))
         }
     }
 
@@ -235,7 +307,7 @@ mod tests {
         (router(Arc::new(Mutex::new(tokens))), plaintext)
     }
 
-    fn app_with_docs_server() -> (Router, String) {
+    fn app_with_docs_server() -> (Router, String, Arc<CallLog>) {
         let mut tokens = TokenService::new();
         let issued = tokens.issue("cursor");
         let plaintext = issued.plaintext.clone();
@@ -252,12 +324,39 @@ mod tests {
                 }],
             }),
         });
+        let call_log = Arc::new(CallLog::memory().unwrap());
         (
             router_with_aggregator(
                 Arc::new(Mutex::new(tokens)),
                 Arc::new(AsyncMutex::new(aggregator)),
+                call_log.clone(),
             ),
             plaintext,
+            call_log,
+        )
+    }
+
+    fn app_with_failing_server() -> (Router, String, Arc<CallLog>) {
+        let mut tokens = TokenService::new();
+        let issued = tokens.issue("cursor");
+        let plaintext = issued.plaintext.clone();
+        let mut aggregator = Aggregator::new();
+        aggregator.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "flaky".into(),
+            running: true,
+            tool_permissions: Default::default(),
+            backend: Arc::new(FailingBackend),
+        });
+        let call_log = Arc::new(CallLog::memory().unwrap());
+        (
+            router_with_aggregator(
+                Arc::new(Mutex::new(tokens)),
+                Arc::new(AsyncMutex::new(aggregator)),
+                call_log.clone(),
+            ),
+            plaintext,
+            call_log,
         )
     }
 
@@ -339,7 +438,7 @@ mod tests {
 
     #[tokio::test]
     async fn tools_list_returns_prefixed_names() {
-        let (app, token) = app_with_docs_server();
+        let (app, token, _) = app_with_docs_server();
         let (status, json) = post_mcp(
             app,
             &token,
@@ -361,27 +460,83 @@ mod tests {
         assert_eq!(names, vec!["docs__search"]);
     }
 
+    fn call_body(id: i64, name: &str, arguments: Value) -> Value {
+        json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": name, "arguments": arguments }
+        })
+    }
+
     #[tokio::test]
     async fn tools_call_routes_to_backend() {
-        let (app, token) = app_with_docs_server();
-        let (status, json) = post_mcp(
-            app,
-            &token,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 3,
-                "method": "tools/call",
-                "params": {
-                    "name": "docs__search",
-                    "arguments": { "q": "hello" }
-                }
-            }),
-        )
-        .await;
+        let (app, token, _) = app_with_docs_server();
+        let (status, json) = post_mcp(app, &token, call_body(3, "docs__search", json!({ "q": "hello" })))
+            .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["result"]["isError"], false);
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("search"), "{text}");
         assert!(text.contains("hello"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn tools_call_records_metadata_for_success() {
+        let (app, token, call_log) = app_with_docs_server();
+        let (status, json) =
+            post_mcp(app, &token, call_body(3, "docs__search", json!({ "q": "hello" }))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"]["isError"], false);
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server, "docs");
+        assert_eq!(rows[0].tool, "search");
+        assert_eq!(rows[0].client, "cursor");
+        assert!(rows[0].ok);
+        assert_eq!(rows[0].error_kind, None);
+        assert!(rows[0].duration_ms >= 0);
+        assert!(rows[0].called_at > 0);
+    }
+
+    #[tokio::test]
+    async fn tools_call_records_unknown_tool_failure() {
+        let (app, token, call_log) = app_with_docs_server();
+        let (status, json) = post_mcp(app, &token, call_body(4, "docs__missing", json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(json["error"].is_object());
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server, "docs");
+        assert_eq!(rows[0].tool, "missing");
+        assert!(!rows[0].ok);
+        assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_records_backend_error_kind() {
+        let (app, token, call_log) = app_with_failing_server();
+        let (status, json) = post_mcp(app, &token, call_body(5, "flaky__boom", json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"]["isError"], true);
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].ok);
+        assert_eq!(rows[0].error_kind.as_deref(), Some("backend_error"));
+        assert_eq!(rows[0].server, "flaky");
+        assert_eq!(rows[0].tool, "boom");
+    }
+
+    #[tokio::test]
+    async fn tools_call_without_delimiter_logs_empty_server() {
+        let (app, token, call_log) = app_with_docs_server();
+        let (_, json) = post_mcp(app, &token, call_body(6, "nodelimiter", json!({}))).await;
+        assert!(json["error"].is_object());
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server, "");
+        assert_eq!(rows[0].tool, "nodelimiter");
+        assert!(!rows[0].ok);
+        assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
     }
 }
