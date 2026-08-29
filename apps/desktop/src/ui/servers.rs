@@ -100,14 +100,14 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 
         if server.status == ServerStatus::Running {
             if let Some(tools) = app.tools_by_server.get(&id) {
-                let collapsed = app.tools_collapsed.contains(&id);
+                let expanded = app.tools_expanded.contains(&id);
                 if !tools.is_empty() {
-                    let label = tools_toggle_label(tools.len(), !collapsed);
+                    let label = tools_toggle_label(tools.len(), expanded);
                     content = content.push(
                         secondary_button(label).on_press(Message::ToggleToolList(id.clone())),
                     );
                 }
-                if !collapsed {
+                if expanded {
                     let mut tool_list = column![].spacing(6);
                     for tool in tools {
                         let tool_id = id.clone();

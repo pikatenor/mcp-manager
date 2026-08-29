@@ -259,8 +259,8 @@ pub(crate) struct App {
     pub(crate) tool_calls: Vec<ToolCallEntry>,
     pub(crate) servers: Vec<ServerState>,
     pub(crate) tools_by_server: HashMap<String, Vec<ServerToolView>>,
-    /// Server ids whose tool list is collapsed; sessions only, not persisted.
-    pub(crate) tools_collapsed: HashSet<String>,
+    /// Server ids whose tool list is expanded; lists start collapsed.
+    pub(crate) tools_expanded: HashSet<String>,
     pub(crate) oauth_by_server: HashMap<String, bool>,
     pub(crate) server_name: String,
     pub(crate) server_type: FormServerType,
@@ -407,7 +407,7 @@ impl App {
             tool_calls: Vec::new(),
             servers: Vec::new(),
             tools_by_server: HashMap::new(),
-            tools_collapsed: HashSet::new(),
+            tools_expanded: HashSet::new(),
             oauth_by_server: HashMap::new(),
             server_name: String::new(),
             server_type: FormServerType::Local,
@@ -788,7 +788,7 @@ impl App {
             }
             Message::Delete(id) => {
                 let session = self.session.clone();
-                self.tools_collapsed.remove(&id);
+                self.tools_expanded.remove(&id);
                 self.notice = None;
                 Task::perform(
                     async move { session.delete_server(&id).await.map(|_| ()) },
@@ -803,8 +803,8 @@ impl App {
                 )
             }
             Message::ToggleToolList(id) => {
-                if self.tools_collapsed.take(&id).is_none() {
-                    self.tools_collapsed.insert(id);
+                if self.tools_expanded.take(&id).is_none() {
+                    self.tools_expanded.insert(id);
                 }
                 Task::none()
             }
