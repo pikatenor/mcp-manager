@@ -5,12 +5,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::extract::{Json, RawForm};
-use axum::http::{header, Request, StatusCode};
+use axum::http::{header, HeaderMap, Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use base64::Engine;
 use mcp_core::{BackendConnector, ServerConfig, ServerType};
-use mcp_platform::{server_bearer_key, server_oauth_key, MemorySecretStore, SecretStore};
+use mcp_platform::{
+    server_bearer_key, server_oauth_client_id_key, server_oauth_client_secret_key,
+    server_oauth_key, MemorySecretStore, SecretStore,
+};
 use mcp_runtime::McpConnector;
 use serde_json::{json, Value};
 use tokio::net::TcpListener;
@@ -326,14 +330,32 @@ async fn remote_rejects_plain_http_to_public_host() {
     ));
 }
 
+struct AuthStreamable {
+    addr: SocketAddr,
+    current_token: Arc<Mutex<String>>,
+    refresh_count: Arc<Mutex<u32>>,
+    token_auth_headers: Arc<Mutex<Vec<Option<String>>>>,
+}
+
 /// Fake AS + guarded MCP endpoint on one host: `/mcp` only accepts the
 /// server's current token and answers 401 with a challenge otherwise.
 async fn spawn_auth_streamable() -> (SocketAddr, Arc<Mutex<String>>, Arc<Mutex<u32>>) {
+    let fake = spawn_auth_streamable_opts(None).await;
+    (fake.addr, fake.current_token, fake.refresh_count)
+}
+
+/// `required_client_auth` makes the token endpoint reject refresh requests
+/// that lack `Authorization: Basic base64(id:secret)` for that client, the
+/// way a confidential client would be validated.
+async fn spawn_auth_streamable_opts(
+    required_client_auth: Option<(&'static str, &'static str)>,
+) -> AuthStreamable {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let origin = format!("http://{addr}");
     let current_token: Arc<Mutex<String>> = Arc::new(Mutex::new("at-initial".into()));
     let refresh_count: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+    let token_auth_headers: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
     let metadata = json!({
         // The path-inserted discovery form implies an issuer with the same path.
         "issuer": format!("{origin}/mcp"),
@@ -342,6 +364,7 @@ async fn spawn_auth_streamable() -> (SocketAddr, Arc<Mutex<String>>, Arc<Mutex<u
         "registration_endpoint": format!("{origin}/register"),
     });
     let token_state = (current_token.clone(), refresh_count.clone());
+    let auth_headers = token_auth_headers.clone();
     let guarded_token = current_token.clone();
     let app = Router::new()
         .route(
@@ -350,12 +373,32 @@ async fn spawn_auth_streamable() -> (SocketAddr, Arc<Mutex<String>>, Arc<Mutex<u
         )
         .route(
             "/token",
-            post(move |RawForm(form): RawForm| {
+            post(move |headers: HeaderMap, RawForm(form): RawForm| {
                 let (current_token, refresh_count) = token_state.clone();
+                let auth_headers = auth_headers.clone();
                 async move {
+                    auth_headers
+                        .lock()
+                        .unwrap()
+                        .push(headers.get(header::AUTHORIZATION).map(|value| value.to_str().unwrap().to_string()));
                     let pairs: HashMap<String, String> =
                         url::form_urlencoded::parse(&form).into_owned().collect();
                     if pairs.get("grant_type").map(String::as_str) == Some("refresh_token") {
+                        if let Some((client_id, client_secret)) = required_client_auth {
+                            let expected = format!(
+                                "Basic {}",
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(format!("{client_id}:{client_secret}"))
+                            );
+                            let received = auth_headers.lock().unwrap().last().cloned().flatten();
+                            if received.as_deref() != Some(expected.as_str()) {
+                                return (
+                                    StatusCode::BAD_REQUEST,
+                                    axum::Json(json!({ "error": "invalid_client" })),
+                                )
+                                    .into_response();
+                            }
+                        }
                         let mut count = refresh_count.lock().unwrap();
                         *count += 1;
                         let token = format!("at-refresh-{count}");
@@ -365,9 +408,11 @@ async fn spawn_auth_streamable() -> (SocketAddr, Arc<Mutex<String>>, Arc<Mutex<u
                             "refresh_token": format!("rt-{count}"),
                             "token_type": "Bearer",
                             "expires_in": 3600
-                        }));
+                        }))
+                        .into_response();
                     }
                     axum::Json(json!({ "access_token": "at-initial", "token_type": "Bearer" }))
+                        .into_response()
                 }
             }),
         )
@@ -401,7 +446,12 @@ async fn spawn_auth_streamable() -> (SocketAddr, Arc<Mutex<String>>, Arc<Mutex<u
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     });
-    (addr, current_token, refresh_count)
+    AuthStreamable {
+        addr,
+        current_token,
+        refresh_count,
+        token_auth_headers,
+    }
 }
 
 fn epoch_now() -> u64 {
@@ -419,8 +469,18 @@ fn seed_credentials(
     expires_in: u64,
     received_at: u64,
 ) {
+    seed_credentials_as(secrets, "cid-1", access_token, expires_in, received_at);
+}
+
+fn seed_credentials_as(
+    secrets: &MemorySecretStore,
+    client_id: &str,
+    access_token: &str,
+    expires_in: u64,
+    received_at: u64,
+) {
     let blob = json!({
-        "client_id": "cid-1",
+        "client_id": client_id,
         "token_response": {
             "access_token": access_token,
             "token_type": "Bearer",
@@ -474,4 +534,44 @@ async fn call_tool_refreshes_after_mid_session_rejection() {
     let text = result.to_string();
     assert!(text.contains("echo"), "{text}");
     assert_eq!(*refresh_count.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn connect_refreshes_with_client_authentication_for_confidential_clients() {
+    let fake = spawn_auth_streamable_opts(Some(("cid-static", "sec-static"))).await;
+    let secrets = Arc::new(MemorySecretStore::new());
+    let two_hours_ago = epoch_now().saturating_sub(7200);
+    seed_credentials_as(secrets.as_ref(), "cid-static", "at-initial", 3600, two_hours_ago);
+    // The confidential client identity survives restarts in the keychain;
+    // the restore path alone only recovers the public half of it.
+    secrets
+        .set(&server_oauth_client_id_key("srv"), "cid-static")
+        .unwrap();
+    secrets
+        .set(&server_oauth_client_secret_key("srv"), "sec-static")
+        .unwrap();
+
+    let connector = McpConnector::new(secrets.clone());
+    let config = remote_config(
+        ServerType::RemoteStreamable,
+        format!("http://{}/mcp", fake.addr),
+    );
+    let backend = connector.connect(&config, &HashMap::new()).await.unwrap();
+    let tools = backend.list_tools().await.unwrap();
+    assert_eq!(tools[0].name, "echo");
+
+    assert_eq!(*fake.refresh_count.lock().unwrap(), 1);
+    let expected = format!(
+        "Basic {}",
+        base64::engine::general_purpose::STANDARD.encode("cid-static:sec-static")
+    );
+    assert_eq!(
+        fake.token_auth_headers.lock().unwrap()[0].as_deref(),
+        Some(expected.as_str())
+    );
+    // The refreshed token is persisted, including the bearer mirror.
+    assert_eq!(
+        secrets.get(&server_bearer_key("srv")).unwrap().as_deref(),
+        Some("at-refresh-1")
+    );
 }
