@@ -3,7 +3,10 @@ use std::sync::Arc;
 
 use iced::widget::{column, container, row, scrollable, space, text, text_editor};
 use iced::{clipboard, window, Alignment, Element, Font, Length, Size, Subscription, Task};
-use mcp_core::{IssuedToken, ServerState, ServerStatus, ServerType, TokenRecord, ToolCallEntry};
+use mcp_core::{
+    run_pending, IssuedToken, Migration, MigrationLog, MigrationOutcome, ServerState, ServerStatus,
+    ServerType, TokenRecord, ToolCallEntry,
+};
 use mcp_platform::{AppPaths, NativeAppPaths, NativeBrowserOpener, SecretStore};
 use mcp_runtime::McpConnector;
 
@@ -14,7 +17,7 @@ use crate::ui;
 use crate::shell::{on_tray, parse_tray_menu_id};
 
 #[cfg(target_os = "macos")]
-use mcp_platform::KeychainSecretStore;
+use mcp_platform::{BundleSecretStore, KeychainSecretStore};
 #[cfg(not(target_os = "macos"))]
 use mcp_platform::MemorySecretStore;
 
@@ -341,12 +344,38 @@ pub struct Snapshot {
 fn secret_store() -> Arc<dyn SecretStore> {
     #[cfg(target_os = "macos")]
     {
-        Arc::new(KeychainSecretStore::new())
+        // One keychain item total: a binary change costs at most one
+        // re-authorization prompt instead of one per secret.
+        Arc::new(BundleSecretStore::new(Arc::new(KeychainSecretStore::new())))
     }
     #[cfg(not(target_os = "macos"))]
     {
         Arc::new(MemorySecretStore::new())
     }
+}
+
+/// The raw per-key store the pre-bundle binary wrote to, kept only so the
+/// startup migration can fold its items into the bundle.
+fn legacy_secret_store() -> Option<Arc<dyn SecretStore>> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(Arc::new(KeychainSecretStore::new()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// The one-time jobs this binary knows about, in registration order.
+fn desktop_migrations<'a>(
+    session: &'a Session,
+    legacy: &'a dyn SecretStore,
+) -> Vec<Migration<'a>> {
+    vec![Migration {
+        name: "0001-fold-legacy-secrets-into-single-item",
+        run: Box::pin(session.migrate_legacy_secrets(legacy)),
+    }]
 }
 
 async fn load_snapshot(session: Session) -> Result<Snapshot, String> {
@@ -425,8 +454,27 @@ impl App {
             error: None,
         };
 
+        let migrations = MigrationLog::open_sqlite(&data_dir.join("migrations.db"))
+            .expect("open migration ledger");
+        let legacy = legacy_secret_store();
         let startup = Task::perform(
             async move {
+                // Migrations precede auto-start: servers must not read the
+                // store before update-time jobs have finished moving state.
+                if let Some(legacy) = legacy.as_deref() {
+                    for outcome in run_pending(&migrations, desktop_migrations(&session, legacy)).await
+                    {
+                        match outcome {
+                            MigrationOutcome::Applied(name) => {
+                                eprintln!("migration applied: {name}")
+                            }
+                            MigrationOutcome::Failed { name, error } => {
+                                eprintln!("migration failed: {name}: {error}")
+                            }
+                            MigrationOutcome::Skipped(_) => {}
+                        }
+                    }
+                }
                 session.auto_start().await?;
                 load_snapshot(session).await
             },

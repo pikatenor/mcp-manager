@@ -214,16 +214,30 @@ fn validate_oauth_client(request: &AddServerRequest) -> Result<(), String> {
     Ok(())
 }
 
+/// Every secret key one server owns: env values plus the fixed bearer and
+/// OAuth keys. Migration and deletion must agree on this set, or a moved
+/// secret would survive server deletion.
+fn server_secret_keys(config: &ServerConfig) -> Vec<String> {
+    let mut keys: Vec<String> = config
+        .env_keys
+        .iter()
+        .map(|env| server_env_key(&config.id, env))
+        .collect();
+    keys.extend([
+        server_bearer_key(&config.id),
+        server_oauth_key(&config.id, "access_token"),
+        server_oauth_key(&config.id, "refresh_token"),
+        server_oauth_key(&config.id, "credentials"),
+        server_oauth_client_id_key(&config.id),
+        server_oauth_client_secret_key(&config.id),
+    ]);
+    keys
+}
+
 fn delete_secrets(store: &dyn SecretStore, config: &ServerConfig) {
-    for key in &config.env_keys {
-        let _ = store.delete(&server_env_key(&config.id, key));
+    for key in server_secret_keys(config) {
+        let _ = store.delete(&key);
     }
-    let _ = store.delete(&server_bearer_key(&config.id));
-    let _ = store.delete(&server_oauth_key(&config.id, "access_token"));
-    let _ = store.delete(&server_oauth_key(&config.id, "refresh_token"));
-    let _ = store.delete(&server_oauth_client_id_key(&config.id));
-    let _ = store.delete(&server_oauth_client_secret_key(&config.id));
-    let _ = store.delete(&server_oauth_key(&config.id, "credentials"));
 }
 
 impl Session {
@@ -417,6 +431,38 @@ impl Session {
             bearer,
             oauth_client_id,
         })
+    }
+
+    /// Copy every legacy per-key secret into the session store and delete the
+    /// legacy items. Aborts without writing anything when a legacy read or
+    /// the bundle write fails, so the next launch retries the whole move;
+    /// keys already moved read as absent, which makes reruns no-ops.
+    pub async fn migrate_legacy_secrets(&self, legacy: &dyn SecretStore) -> Result<(), String> {
+        let keys: Vec<String> = {
+            let registry = self.registry.lock().await;
+            registry
+                .list()
+                .map_err(|e| e.to_string())?
+                .iter()
+                .flat_map(|state| server_secret_keys(&state.config))
+                .collect()
+        };
+        let mut found = HashMap::new();
+        for key in &keys {
+            if let Some(value) = legacy.get(key).map_err(|e| format!("read {key}: {e}"))? {
+                found.insert(key.clone(), value);
+            }
+        }
+        if found.is_empty() {
+            return Ok(());
+        }
+        self.secrets
+            .set_many(&found)
+            .map_err(|e| format!("write secret bundle: {e}"))?;
+        for key in found.keys() {
+            legacy.delete(key).map_err(|e| format!("delete {key}: {e}"))?;
+        }
+        Ok(())
     }
 
     /// Rewrite one server's config in place, keeping its id, disabled flag,
