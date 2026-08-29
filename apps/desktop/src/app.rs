@@ -133,6 +133,10 @@ pub(crate) fn add_request_from_form(input: FormInput<'_>) -> AddServerRequest {
         } else {
             Some(input.bearer.to_string())
         },
+        // The form gains OAuth client fields in the UI wiring; the session
+        // layer already persists them.
+        oauth_client_id: None,
+        oauth_client_secret: None,
     }
 }
 
@@ -540,9 +544,12 @@ impl App {
                             .find(|state| state.config.id == id)
                             .ok_or_else(|| format!("unknown server: {id}"))?
                             .config;
-                        let (env, bearer) = session.server_secret_values(&id).await?;
-                        let mut lines: Vec<String> =
-                            env.iter().map(|(key, value)| format!("{key}={value}")).collect();
+                        let values = session.server_secret_values(&id).await?;
+                        let mut lines: Vec<String> = values
+                            .env
+                            .iter()
+                            .map(|(key, value)| format!("{key}={value}"))
+                            .collect();
                         lines.sort();
                         Ok(EditFormState {
                             id: id.clone(),
@@ -552,7 +559,7 @@ impl App {
                             args: config.args.join(" "),
                             remote_url: config.remote_url.unwrap_or_default(),
                             env_text: lines.join("\n"),
-                            bearer: bearer.unwrap_or_default(),
+                            bearer: values.bearer.unwrap_or_default(),
                             auto_start: config.auto_start,
                         })
                     },

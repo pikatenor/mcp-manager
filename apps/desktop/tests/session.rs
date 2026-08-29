@@ -8,7 +8,8 @@ use mcp_core::{
 };
 use mcp_manager::session::{parse_env, AddServerRequest, ImportOutcome, Session};
 use mcp_platform::{
-    server_bearer_key, server_env_key, server_oauth_key, BrowserError, BrowserOpener,
+    server_bearer_key, server_env_key, server_oauth_client_id_key,
+    server_oauth_client_secret_key, server_oauth_key, BrowserError, BrowserOpener,
     MemorySecretStore, SecretStore,
 };
 
@@ -96,6 +97,8 @@ fn local_add(name: &str) -> AddServerRequest {
         remote_url: None,
         auto_start: true,
         bearer: None,
+        oauth_client_id: None,
+        oauth_client_secret: None,
     }
 }
 
@@ -109,6 +112,8 @@ fn remote_add(name: &str) -> AddServerRequest {
         remote_url: Some("https://example.com/mcp".into()),
         auto_start: true,
         bearer: None,
+        oauth_client_id: None,
+        oauth_client_secret: None,
     }
 }
 
@@ -267,11 +272,46 @@ async fn add_server_stores_optional_bearer() {
 }
 
 #[tokio::test]
+async fn add_server_stores_oauth_client_credentials() {
+    let fx = session(vec![]);
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-static".into());
+    request.oauth_client_secret = Some("sec-static".into());
+    let config = fx.session.add_server(request).await.unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_id_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("cid-static")
+    );
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_secret_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("sec-static")
+    );
+}
+
+#[tokio::test]
+async fn add_server_rejects_client_secret_without_client_id() {
+    let fx = session(vec![]);
+    let mut request = remote_add("remote");
+    request.oauth_client_secret = Some("sec-orphan".into());
+    let err = fx.session.add_server(request).await.unwrap_err();
+    assert!(err.contains("client id"));
+    assert!(fx.session.list_servers().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn delete_server_removes_secrets() {
     let fx = session(vec![]);
     let mut request = local_add("everything");
     request.env.insert("API_TOKEN".into(), "sk-secret".into());
     request.bearer = Some("tok-1".into());
+    request.oauth_client_id = Some("cid-static".into());
+    request.oauth_client_secret = Some("sec-static".into());
     let config = fx.session.add_server(request).await.unwrap();
     assert!(fx.session.delete_server(&config.id).await.unwrap());
     assert_eq!(
@@ -282,6 +322,18 @@ async fn delete_server_removes_secrets() {
     );
     assert_eq!(
         fx.secrets.get(&server_bearer_key(&config.id)).unwrap(),
+        None
+    );
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_id_key(&config.id))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_secret_key(&config.id))
+            .unwrap(),
         None
     );
     assert!(fx.session.list_servers().await.unwrap().is_empty());
@@ -499,6 +551,152 @@ async fn update_server_keeps_bearer_when_blank_and_overwrites_when_set() {
 }
 
 #[tokio::test]
+async fn update_server_overwrites_and_clears_oauth_client_config() {
+    let fx = session(vec![]);
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-1".into());
+    request.oauth_client_secret = Some("sec-1".into());
+    let config = fx.session.add_server(request).await.unwrap();
+
+    // The secret is never echoed back into the form, so a blank secret on
+    // update means "keep the stored one" — even when the id changes.
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-2".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_id_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("cid-2")
+    );
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_secret_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("sec-1")
+    );
+
+    // A blank client id clears the whole static client config.
+    let request = remote_add("remote");
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_id_key(&config.id))
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_secret_key(&config.id))
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn update_server_invalidates_oauth_tokens_when_client_config_changes() {
+    let fx = session(vec![]);
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-1".into());
+    let config = fx.session.add_server(request).await.unwrap();
+    let seed_tokens = |secrets: &MemorySecretStore, id: &str| {
+        for (key, value) in [
+            (server_oauth_key(id, "credentials"), "blob".to_string()),
+            (server_bearer_key(id), "at-1".to_string()),
+            (server_oauth_key(id, "access_token"), "at-1".to_string()),
+            (server_oauth_key(id, "refresh_token"), "rt-1".to_string()),
+        ] {
+            secrets.set(&key, &value).unwrap();
+        }
+    };
+    seed_tokens(fx.secrets.as_ref(), &config.id);
+
+    // Tokens minted under one client identity cannot refresh under another,
+    // so a config change drops the guaranteed-broken token state.
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-1".into());
+    request.oauth_client_secret = Some("sec-rotated".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_secret_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("sec-rotated")
+    );
+    for key in [
+        server_oauth_key(&config.id, "credentials"),
+        server_bearer_key(&config.id),
+        server_oauth_key(&config.id, "access_token"),
+        server_oauth_key(&config.id, "refresh_token"),
+    ] {
+        assert_eq!(fx.secrets.get(&key).unwrap(), None, "{key}");
+    }
+
+    // A byte-identical save (id + re-typed secret) is not a change and keeps
+    // the token state.
+    seed_tokens(fx.secrets.as_ref(), &config.id);
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-1".into());
+    request.oauth_client_secret = Some("sec-rotated".into());
+    fx.session
+        .update_server(&config.id, request)
+        .await
+        .unwrap();
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_key(&config.id, "credentials"))
+            .unwrap()
+            .as_deref(),
+        Some("blob")
+    );
+}
+
+#[tokio::test]
+async fn update_server_rejects_client_secret_without_client_id_and_keeps_config() {
+    let fx = session(vec![]);
+    let mut request = remote_add("remote");
+    request.oauth_client_id = Some("cid-1".into());
+    request.oauth_client_secret = Some("sec-1".into());
+    let config = fx.session.add_server(request).await.unwrap();
+
+    let mut request = remote_add("remote");
+    request.oauth_client_secret = Some("sec-orphan".into());
+    let err = fx
+        .session
+        .update_server(&config.id, request)
+        .await
+        .unwrap_err();
+    assert!(err.contains("client id"));
+    // The rejected update must not touch the stored client identity.
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_id_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("cid-1")
+    );
+    assert_eq!(
+        fx.secrets
+            .get(&server_oauth_client_secret_key(&config.id))
+            .unwrap()
+            .as_deref(),
+        Some("sec-1")
+    );
+}
+
+#[tokio::test]
 async fn update_server_restarts_running_server() {
     let (fx, spy) = spy_session();
     let mut request = local_add("everything");
@@ -580,30 +778,27 @@ async fn update_server_rejects_rename_onto_existing() {
 }
 
 #[tokio::test]
-async fn server_secret_values_returns_env_and_bearer() {
+async fn server_secret_values_returns_env_bearer_and_oauth_client_id() {
     let fx = session(vec![]);
     let mut remote = remote_add("remote");
     remote.env.insert("A".into(), "1".into());
     remote.bearer = Some("tok-1".into());
+    remote.oauth_client_id = Some("cid-static".into());
+    remote.oauth_client_secret = Some("sec-static".into());
     let config = fx.session.add_server(remote).await.unwrap();
-    let (env, bearer) = fx
-        .session
-        .server_secret_values(&config.id)
-        .await
-        .unwrap();
-    assert_eq!(env.get("A").map(String::as_str), Some("1"));
-    assert_eq!(bearer.as_deref(), Some("tok-1"));
+    let values = fx.session.server_secret_values(&config.id).await.unwrap();
+    assert_eq!(values.env.get("A").map(String::as_str), Some("1"));
+    assert_eq!(values.bearer.as_deref(), Some("tok-1"));
+    // The id prefills the edit form; the secret never does.
+    assert_eq!(values.oauth_client_id.as_deref(), Some("cid-static"));
 
     let mut local = local_add("everything");
     local.env.insert("B".into(), "2".into());
     let config = fx.session.add_server(local).await.unwrap();
-    let (env, bearer) = fx
-        .session
-        .server_secret_values(&config.id)
-        .await
-        .unwrap();
-    assert_eq!(env.get("B").map(String::as_str), Some("2"));
-    assert_eq!(bearer, None);
+    let values = fx.session.server_secret_values(&config.id).await.unwrap();
+    assert_eq!(values.env.get("B").map(String::as_str), Some("2"));
+    assert_eq!(values.bearer, None);
+    assert_eq!(values.oauth_client_id, None);
 }
 
 #[tokio::test]
