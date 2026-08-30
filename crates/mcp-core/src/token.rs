@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use rand::RngCore;
+use rand::Rng;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
