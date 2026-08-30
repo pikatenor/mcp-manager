@@ -3,19 +3,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::broadcast;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Schema served for tools whose upstream omits `inputSchema`; the MCP spec
+/// requires every tool to carry an object schema.
+pub fn empty_input_schema() -> Value {
+    json!({ "type": "object", "properties": {} })
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
     pub description: Option<String>,
+    #[serde(rename = "inputSchema", default = "empty_input_schema")]
+    pub input_schema: Value,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggregatedTool {
     pub name: String,
     pub description: Option<String>,
+    #[serde(rename = "inputSchema", default = "empty_input_schema")]
+    pub input_schema: Value,
     pub source_server: String,
 }
 
@@ -120,6 +130,7 @@ impl Aggregator {
                 tools.push(AggregatedTool {
                     name: crate::naming::prefix_tool_name(&server.name, &tool.name),
                     description: tool.description,
+                    input_schema: tool.input_schema,
                     source_server: server.name.clone(),
                 });
             }
@@ -188,6 +199,11 @@ mod tests {
         Tool {
             name: name.into(),
             description: Some(format!("{name} desc")),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"]
+            }),
         }
     }
 
@@ -215,6 +231,29 @@ mod tests {
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].name, "github__list_issues");
         assert_eq!(tools[0].source_server, "github");
+    }
+
+    #[tokio::test]
+    async fn list_tools_preserves_input_schema() {
+        let backend = FakeBackend::new(vec![tool("search")]);
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: HashMap::new(),
+            backend,
+        });
+
+        let tools = agg.list_tools().await.unwrap();
+        assert_eq!(
+            tools[0].input_schema,
+            json!({
+                "type": "object",
+                "properties": { "q": { "type": "string" } },
+                "required": ["q"]
+            })
+        );
     }
 
     #[tokio::test]

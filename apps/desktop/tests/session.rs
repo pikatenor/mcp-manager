@@ -84,6 +84,7 @@ fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
         description: None,
+        input_schema: serde_json::json!({ "type": "object", "properties": {} }),
     }
 }
 

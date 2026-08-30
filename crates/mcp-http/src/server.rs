@@ -212,7 +212,7 @@ async fn mcp_handler(
                             json!({
                                 "name": tool.name,
                                 "description": tool.description.unwrap_or_default(),
-                                "inputSchema": { "type": "object", "properties": {} }
+                                "inputSchema": tool.input_schema
                             })
                         })
                         .collect();
@@ -303,6 +303,7 @@ mod tests {
             Ok(vec![Tool {
                 name: "boom".into(),
                 description: None,
+                input_schema: serde_json::json!({ "type": "object", "properties": {} }),
             }])
         }
 
@@ -345,6 +346,11 @@ mod tests {
                 tools: vec![Tool {
                     name: "search".into(),
                     description: Some("search docs".into()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "q": { "type": "string" } },
+                        "required": ["q"]
+                    }),
                 }],
             }),
         });
@@ -374,6 +380,11 @@ mod tests {
                 tools: vec![Tool {
                     name: "search".into(),
                     description: Some("search docs".into()),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "q": { "type": "string" } },
+                        "required": ["q"]
+                    }),
                 }],
             }),
         });
@@ -545,6 +556,27 @@ mod tests {
             .map(|t| t["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, vec!["docs__search"]);
+    }
+
+    #[tokio::test]
+    async fn tools_list_returns_input_schema() {
+        let (app, token, _) = app_with_docs_server();
+        let (status, json) = post_mcp(
+            app,
+            &token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let schema = &json["result"]["tools"][0]["inputSchema"];
+        assert_eq!(schema["type"], "object");
+        assert_eq!(schema["properties"]["q"]["type"], "string");
+        assert_eq!(schema["required"][0], "q");
     }
 
     fn call_body(id: i64, name: &str, arguments: Value) -> Value {
