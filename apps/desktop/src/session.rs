@@ -9,9 +9,8 @@ use mcp_core::{
     ToolCallEntry,
 };
 use mcp_platform::{
-    server_bearer_key, server_env_key, server_oauth_client_id_key,
-    server_oauth_client_secret_key, server_oauth_key, BrowserOpener, SecretStore,
-    SecretStoreError,
+    server_bearer_key, server_env_key, server_oauth_client_id_key, server_oauth_client_secret_key,
+    server_oauth_key, BrowserOpener, SecretStore, SecretStoreError,
 };
 use mcp_runtime::OAuthFlow;
 use tokio::sync::Mutex as AsyncMutex;
@@ -190,7 +189,10 @@ fn persist_oauth_client(
         return Ok(());
     };
     store.set(&server_oauth_client_id_key(id), client_id)?;
-    if let Some(secret) = client_secret.map(str::trim).filter(|value| !value.is_empty()) {
+    if let Some(secret) = client_secret
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
         store.set(&server_oauth_client_secret_key(id), secret)?;
     }
     Ok(())
@@ -332,7 +334,11 @@ impl Session {
 
     /// Removes every revoked record, returning how many were dropped.
     pub fn clear_revoked_tokens(&self) -> Result<usize, String> {
-        Ok(self.tokens.lock().map_err(|e| e.to_string())?.clear_revoked())
+        Ok(self
+            .tokens
+            .lock()
+            .map_err(|e| e.to_string())?
+            .clear_revoked())
     }
 
     pub async fn list_servers(&self) -> Result<Vec<ServerState>, String> {
@@ -460,7 +466,9 @@ impl Session {
             .set_many(&found)
             .map_err(|e| format!("write secret bundle: {e}"))?;
         for key in found.keys() {
-            legacy.delete(key).map_err(|e| format!("delete {key}: {e}"))?;
+            legacy
+                .delete(key)
+                .map_err(|e| format!("delete {key}: {e}"))?;
         }
         Ok(())
     }
@@ -510,8 +518,13 @@ impl Session {
                 let _ = self.secrets.delete(&server_env_key(id, key));
             }
         }
-        persist_secrets(self.secrets.as_ref(), id, &request.env, request.bearer.as_deref())
-            .map_err(|e| e.to_string())?;
+        persist_secrets(
+            self.secrets.as_ref(),
+            id,
+            &request.env,
+            request.bearer.as_deref(),
+        )
+        .map_err(|e| e.to_string())?;
         persist_oauth_client(
             self.secrets.as_ref(),
             id,

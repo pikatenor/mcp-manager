@@ -8,9 +8,9 @@ use mcp_core::{
 };
 use mcp_manager::session::{parse_env, AddServerRequest, ImportOutcome, Session};
 use mcp_platform::{
-    server_bearer_key, server_env_key, server_oauth_client_id_key,
-    server_oauth_client_secret_key, server_oauth_key, BrowserError, BrowserOpener,
-    BundleSecretStore, MemorySecretStore, SecretStore, SecretStoreError,
+    server_bearer_key, server_env_key, server_oauth_client_id_key, server_oauth_client_secret_key,
+    server_oauth_key, BrowserError, BrowserOpener, BundleSecretStore, MemorySecretStore,
+    SecretStore, SecretStoreError,
 };
 
 struct StaticBackend {
@@ -157,13 +157,16 @@ impl BackendConnector for ToggleConnector {
     }
 }
 
-fn open_session(
-    connector: Arc<dyn BackendConnector>,
-) -> Fixture {
+fn open_session(connector: Arc<dyn BackendConnector>) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let secrets = Arc::new(MemorySecretStore::new());
-    let session = Session::open(dir.path(), connector, secrets.clone(), Arc::new(NoopBrowser))
-        .unwrap();
+    let session = Session::open(
+        dir.path(),
+        connector,
+        secrets.clone(),
+        Arc::new(NoopBrowser),
+    )
+    .unwrap();
     Fixture {
         session,
         secrets,
@@ -518,10 +521,7 @@ async fn update_server_rewrites_config_and_preserves_permissions() {
 
     let mut request = local_add("renamed");
     request.command = Some("docker".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
 
     let listed = fx.session.list_servers().await.unwrap();
     assert_eq!(listed.len(), 1);
@@ -544,10 +544,7 @@ async fn update_server_replaces_env_secrets() {
 
     let mut request = local_add("everything");
     request.env.insert("A".into(), "3".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
 
     assert_eq!(
         fx.secrets
@@ -572,10 +569,7 @@ async fn update_server_keeps_bearer_when_blank_and_overwrites_when_set() {
     let config = fx.session.add_server(request).await.unwrap();
 
     let request = remote_add("remote");
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
     assert_eq!(
         fx.secrets
             .get(&server_bearer_key(&config.id))
@@ -586,10 +580,7 @@ async fn update_server_keeps_bearer_when_blank_and_overwrites_when_set() {
 
     let mut request = remote_add("remote");
     request.bearer = Some("tok-2".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
     assert_eq!(
         fx.secrets
             .get(&server_bearer_key(&config.id))
@@ -611,10 +602,7 @@ async fn update_server_overwrites_and_clears_oauth_client_config() {
     // update means "keep the stored one" — even when the id changes.
     let mut request = remote_add("remote");
     request.oauth_client_id = Some("cid-2".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
     assert_eq!(
         fx.secrets
             .get(&server_oauth_client_id_key(&config.id))
@@ -632,10 +620,7 @@ async fn update_server_overwrites_and_clears_oauth_client_config() {
 
     // A blank client id clears the whole static client config.
     let request = remote_add("remote");
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
     assert_eq!(
         fx.secrets
             .get(&server_oauth_client_id_key(&config.id))
@@ -673,10 +658,7 @@ async fn update_server_invalidates_oauth_tokens_when_client_config_changes() {
     let mut request = remote_add("remote");
     request.oauth_client_id = Some("cid-1".into());
     request.oauth_client_secret = Some("sec-rotated".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
     assert_eq!(
         fx.secrets
             .get(&server_oauth_client_secret_key(&config.id))
@@ -699,10 +681,7 @@ async fn update_server_invalidates_oauth_tokens_when_client_config_changes() {
     let mut request = remote_add("remote");
     request.oauth_client_id = Some("cid-1".into());
     request.oauth_client_secret = Some("sec-rotated".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
     assert_eq!(
         fx.secrets
             .get(&server_oauth_key(&config.id, "credentials"))
@@ -755,10 +734,7 @@ async fn update_server_restarts_running_server() {
 
     let mut request = local_add("everything");
     request.env.insert("API_TOKEN".into(), "sk-2".into());
-    fx.session
-        .update_server(&config.id, request)
-        .await
-        .unwrap();
+    fx.session.update_server(&config.id, request).await.unwrap();
 
     assert_eq!(
         fx.session.list_servers().await.unwrap()[0].status,
@@ -766,10 +742,7 @@ async fn update_server_restarts_running_server() {
     );
     let seen = spy.seen.lock().unwrap();
     assert_eq!(seen.len(), 2);
-    assert_eq!(
-        seen[1].1.get("API_TOKEN").map(String::as_str),
-        Some("sk-2")
-    );
+    assert_eq!(seen[1].1.get("API_TOKEN").map(String::as_str), Some("sk-2"));
 }
 
 #[tokio::test]
@@ -792,9 +765,7 @@ async fn update_server_saves_when_restart_fails() {
         .await
         .unwrap();
     fx.session.start_server(&config.id).await.unwrap();
-    toggle
-        .fail
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    toggle.fail.store(true, std::sync::atomic::Ordering::SeqCst);
 
     fx.session
         .update_server(&config.id, local_add("renamed"))
@@ -997,9 +968,14 @@ fn list_tool_calls_orders_newest_first() {
     fx.session
         .call_log()
         .record("docs", "search", "cursor", true, None, 1);
-    fx.session
-        .call_log()
-        .record("github", "issues", "claude", false, Some("backend_error"), 2);
+    fx.session.call_log().record(
+        "github",
+        "issues",
+        "claude",
+        false,
+        Some("backend_error"),
+        2,
+    );
     let rows = fx.session.list_tool_calls(10).unwrap();
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].tool, "issues");
@@ -1211,12 +1187,10 @@ async fn migrate_legacy_secrets_keeps_legacy_when_the_bundle_write_fails() {
     let legacy = Arc::new(MemorySecretStore::new());
     legacy.set(&key, "tok").unwrap();
 
-    assert!(
-        session
-            .migrate_legacy_secrets(legacy.as_ref())
-            .await
-            .is_err()
-    );
+    assert!(session
+        .migrate_legacy_secrets(legacy.as_ref())
+        .await
+        .is_err());
     // The legacy item survives so the next launch can retry the move.
     assert_eq!(legacy.get(&key).unwrap().as_deref(), Some("tok"));
 }

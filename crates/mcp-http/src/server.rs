@@ -89,7 +89,11 @@ pub async fn serve_with_listener_and_aggregator(
     aggregator: Arc<AsyncMutex<Aggregator>>,
     call_log: Arc<CallLog>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, router_with_aggregator(tokens, aggregator, call_log)).await
+    axum::serve(
+        listener,
+        router_with_aggregator(tokens, aggregator, call_log),
+    )
+    .await
 }
 
 async fn require_token(
@@ -307,7 +311,11 @@ mod tests {
             }])
         }
 
-        async fn call_tool(&self, _name: &str, _arguments: Value) -> Result<Value, AggregatorError> {
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+        ) -> Result<Value, AggregatorError> {
             Err(AggregatorError::Backend("upstream refused".into()))
         }
     }
@@ -591,8 +599,12 @@ mod tests {
     #[tokio::test]
     async fn tools_call_routes_to_backend() {
         let (app, token, _) = app_with_docs_server();
-        let (status, json) = post_mcp(app, &token, call_body(3, "docs__search", json!({ "q": "hello" })))
-            .await;
+        let (status, json) = post_mcp(
+            app,
+            &token,
+            call_body(3, "docs__search", json!({ "q": "hello" })),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["result"]["isError"], false);
         let text = json["result"]["content"][0]["text"].as_str().unwrap();
@@ -603,8 +615,12 @@ mod tests {
     #[tokio::test]
     async fn tools_call_records_metadata_for_success() {
         let (app, token, call_log) = app_with_docs_server();
-        let (status, json) =
-            post_mcp(app, &token, call_body(3, "docs__search", json!({ "q": "hello" }))).await;
+        let (status, json) = post_mcp(
+            app,
+            &token,
+            call_body(3, "docs__search", json!({ "q": "hello" })),
+        )
+        .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["result"]["isError"], false);
         let rows = call_log.list_recent(10).unwrap();

@@ -20,7 +20,7 @@ pub use bundle::{BundleSecretStore, DEFAULT_BUNDLE_ACCOUNT};
 pub use keychain::KeychainSecretStore;
 pub use memory::MemorySecretStore;
 pub use secrets::{
-    server_bearer_key, server_env_key, server_oauth_client_id_key,
-    server_oauth_client_secret_key, server_oauth_key, SecretStore, SecretStoreError,
+    server_bearer_key, server_env_key, server_oauth_client_id_key, server_oauth_client_secret_key,
+    server_oauth_key, SecretStore, SecretStoreError,
 };
 pub use shell_env::fix_path_for_children;

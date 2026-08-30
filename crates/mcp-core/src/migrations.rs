@@ -54,7 +54,9 @@ impl MigrationLog {
             .lock()
             .map_err(|e| StoreError::Database(e.to_string()))?;
         let found = conn
-            .query_row("SELECT 1 FROM migrations WHERE name = ?1", [name], |_| Ok(()))
+            .query_row("SELECT 1 FROM migrations WHERE name = ?1", [name], |_| {
+                Ok(())
+            })
             .optional()
             .map_err(|e| StoreError::Database(e.to_string()))?;
         Ok(found.is_some())
@@ -127,11 +129,7 @@ mod tests {
         (log, dir)
     }
 
-    fn job(
-        name: &'static str,
-        ran: Arc<Mutex<Vec<&'static str>>>,
-        ok: bool,
-    ) -> Migration<'static> {
+    fn job(name: &'static str, ran: Arc<Mutex<Vec<&'static str>>>, ok: bool) -> Migration<'static> {
         Migration {
             name,
             run: Box::pin(async move {
@@ -151,12 +149,18 @@ mod tests {
         let ran = Arc::new(Mutex::new(Vec::new()));
         let outcomes = run_pending(
             &log,
-            vec![job("0001", ran.clone(), true), job("0002", ran.clone(), true)],
+            vec![
+                job("0001", ran.clone(), true),
+                job("0002", ran.clone(), true),
+            ],
         )
         .await;
         assert_eq!(
             outcomes,
-            vec![MigrationOutcome::Applied("0001"), MigrationOutcome::Applied("0002")]
+            vec![
+                MigrationOutcome::Applied("0001"),
+                MigrationOutcome::Applied("0002")
+            ]
         );
         assert_eq!(*ran.lock().unwrap(), vec!["0001", "0002"]);
         assert!(log.is_applied("0001").unwrap());

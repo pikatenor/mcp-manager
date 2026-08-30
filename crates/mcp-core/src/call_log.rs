@@ -109,7 +109,10 @@ impl CallLog {
 
     /// Newest `limit` entries, most recent first.
     pub fn list_recent(&self, limit: usize) -> Result<Vec<ToolCallEntry>, StoreError> {
-        let conn = self.conn.lock().map_err(|e| StoreError::Database(e.to_string()))?;
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| StoreError::Database(e.to_string()))?;
         let mut stmt = conn
             .prepare(
                 "SELECT id, server, tool, client, ok, error_kind, duration_ms, called_at

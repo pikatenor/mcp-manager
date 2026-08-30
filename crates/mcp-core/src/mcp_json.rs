@@ -154,9 +154,9 @@ fn parse_entry(entry: &serde_json::Value) -> Result<ImportedServer, String> {
             let authorization = authorization
                 .as_str()
                 .ok_or_else(|| "Authorization header must be a string".to_string())?;
-            let token = authorization.strip_prefix("Bearer ").ok_or(
-                "only Bearer Authorization headers are supported",
-            )?;
+            let token = authorization
+                .strip_prefix("Bearer ")
+                .ok_or("only Bearer Authorization headers are supported")?;
             bearer = Some(token.to_string());
         }
     }
@@ -209,9 +209,7 @@ mod tests {
 
     #[test]
     fn parses_bare_server_map_without_wrapper() {
-        let parsed = parse_mcp_servers(
-            r#"{ "everything": { "command": "npx", "args": [] } }"#,
-        );
+        let parsed = parse_mcp_servers(r#"{ "everything": { "command": "npx", "args": [] } }"#);
         assert!(parsed.errors.is_empty());
         assert_eq!(parsed.servers.len(), 1);
         assert_eq!(parsed.servers[0].name, "everything");
@@ -220,8 +218,9 @@ mod tests {
 
     #[test]
     fn url_entry_defaults_to_remote_streamable() {
-        let parsed =
-            parse_mcp_servers(r#"{ "mcpServers": { "atlas": { "url": "https://example.com/mcp" } } }"#);
+        let parsed = parse_mcp_servers(
+            r#"{ "mcpServers": { "atlas": { "url": "https://example.com/mcp" } } }"#,
+        );
         assert!(parsed.errors.is_empty());
         assert_eq!(parsed.servers[0].server_type, ServerType::RemoteStreamable);
         assert_eq!(
@@ -232,8 +231,9 @@ mod tests {
 
     #[test]
     fn sse_url_suffix_maps_to_legacy_remote() {
-        let parsed =
-            parse_mcp_servers(r#"{ "mcpServers": { "atlas": { "url": "https://example.com/sse" } } }"#);
+        let parsed = parse_mcp_servers(
+            r#"{ "mcpServers": { "atlas": { "url": "https://example.com/sse" } } }"#,
+        );
         assert!(parsed.errors.is_empty());
         assert_eq!(parsed.servers[0].server_type, ServerType::Remote);
     }
@@ -273,9 +273,8 @@ mod tests {
 
     #[test]
     fn entry_without_command_or_url_is_reported() {
-        let parsed = parse_mcp_servers(
-            r#"{ "mcpServers": { "foo": {}, "bar": { "command": "npx" } } }"#,
-        );
+        let parsed =
+            parse_mcp_servers(r#"{ "mcpServers": { "foo": {}, "bar": { "command": "npx" } } }"#);
         assert_eq!(parsed.servers.len(), 1);
         assert_eq!(parsed.servers[0].name, "bar");
         assert_eq!(parsed.errors.len(), 1);

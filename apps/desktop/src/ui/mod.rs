@@ -52,11 +52,9 @@ pub(crate) fn card<'a, M>(content: impl Into<Element<'a, M>>) -> container::Cont
 
 /// Pane title with a count chip, e.g. "Servers  3".
 pub(crate) fn pane_heading(label: &str, count: usize) -> row::Row<'_, Message> {
-    let chip = container(
-        text(count.to_string()).size(12).style(|theme| text::Style {
-            color: Some(theme::of(theme).text_secondary),
-        }),
-    )
+    let chip = container(text(count.to_string()).size(12).style(|theme| text::Style {
+        color: Some(theme::of(theme).text_secondary),
+    }))
     .padding([2, 8])
     .style(styles::chip);
 
@@ -95,20 +93,26 @@ pub(crate) fn primary_button<'a, M: Clone>(label: &'a str) -> button::Button<'a,
 pub(crate) fn secondary_button<'a, M: Clone>(
     label: impl IntoFragment<'a>,
 ) -> button::Button<'a, M> {
-    button(text(label).size(13)).padding([8, 14]).style(styles::secondary)
+    button(text(label).size(13))
+        .padding([8, 14])
+        .style(styles::secondary)
 }
 
 /// Bordered button in the danger color for destructive actions.
 pub(crate) fn danger_button<'a, M: Clone>(label: &'a str) -> button::Button<'a, M> {
-    button(text(label).size(13)).padding([8, 14]).style(styles::danger)
+    button(text(label).size(13))
+        .padding([8, 14])
+        .style(styles::danger)
 }
 
 /// Full-width danger banner for the latest failed operation.
 pub(crate) fn error_banner(error: &str) -> container::Container<'_, Message> {
     container(
-        text(format!("\u{26A0} {error}")).size(13).style(|theme| text::Style {
-            color: Some(theme::of(theme).danger),
-        }),
+        text(format!("\u{26A0} {error}"))
+            .size(13)
+            .style(|theme| text::Style {
+                color: Some(theme::of(theme).danger),
+            }),
     )
     .padding(CARD_PADDING)
     .style(styles::banner_danger)

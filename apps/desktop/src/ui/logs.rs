@@ -69,11 +69,9 @@ fn call_card(entry: &ToolCallEntry) -> container::Container<'_, Message> {
     if !entry.ok {
         if let Some(kind) = &entry.error_kind {
             line = line.push(
-                container(
-                    text(kind).size(12).style(|theme| text::Style {
-                        color: Some(super::theme::of(theme).danger),
-                    }),
-                )
+                container(text(kind).size(12).style(|theme| text::Style {
+                    color: Some(super::theme::of(theme).danger),
+                }))
                 .padding([2, 8])
                 .style(styles::chip),
             );

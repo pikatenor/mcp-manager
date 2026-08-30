@@ -64,9 +64,11 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
                 .style(|theme| text::Style {
                     color: Some(of(theme).text_secondary),
                 }),
-            text(status_label(server.status)).size(13).style(move |theme| text::Style {
-                color: Some(status_color(of(theme), status)),
-            }),
+            text(status_label(server.status))
+                .size(13)
+                .style(move |theme| text::Style {
+                    color: Some(status_color(of(theme), status)),
+                }),
         ]
         .spacing(8)
         .align_y(Alignment::Center)]
@@ -81,11 +83,9 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
         let mut actions = row![].spacing(8);
         actions = actions.push(secondary_button("Edit").on_press(Message::EditServer(id.clone())));
         if server.status == ServerStatus::Running {
-            actions =
-                actions.push(secondary_button("Stop").on_press(Message::Stop(id.clone())));
+            actions = actions.push(secondary_button("Stop").on_press(Message::Stop(id.clone())));
         } else {
-            actions =
-                actions.push(secondary_button("Start").on_press(Message::Start(id.clone())));
+            actions = actions.push(secondary_button("Start").on_press(Message::Start(id.clone())));
         }
         if server.config.server_type != ServerType::Local {
             let label = if app.oauth_by_server.get(&id).copied().unwrap_or(false) {
@@ -114,13 +114,13 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
                         let tool_name = tool.name.clone();
                         tool_list = tool_list.push(
                             row![
-                                checkbox(tool.public)
-                                    .label(tool.name.clone())
-                                    .on_toggle(move |public| Message::ToggleTool {
+                                checkbox(tool.public).label(tool.name.clone()).on_toggle(
+                                    move |public| Message::ToggleTool {
                                         id: tool_id.clone(),
                                         name: tool_name.clone(),
                                         public,
-                                    }),
+                                    }
+                                ),
                                 space::horizontal(),
                                 secondary(if tool.public { "public" } else { "hidden" }),
                             ]
@@ -183,8 +183,7 @@ fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
     } else {
         form = form.push(field(
             "URL",
-            text_input("https://example.com/mcp", &app.remote_url)
-                .on_input(Message::RemoteUrl),
+            text_input("https://example.com/mcp", &app.remote_url).on_input(Message::RemoteUrl),
         ));
     }
 
@@ -220,20 +219,14 @@ fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
         // fixed without disconnecting first.
         form = form.push(field(
             "OAuth client ID",
-            text_input(
-                "optional pre-registered client id",
-                &app.oauth_client_id,
-            )
-            .on_input(Message::OauthClientId),
+            text_input("optional pre-registered client id", &app.oauth_client_id)
+                .on_input(Message::OauthClientId),
         ));
         form = form.push(field(
             "OAuth client secret",
-            text_input(
-                "blank keeps the stored secret",
-                &app.oauth_client_secret,
-            )
-            .secure(true)
-            .on_input(Message::OauthClientSecret),
+            text_input("blank keeps the stored secret", &app.oauth_client_secret)
+                .secure(true)
+                .on_input(Message::OauthClientSecret),
         ));
     }
 

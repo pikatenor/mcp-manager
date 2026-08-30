@@ -147,7 +147,10 @@ async fn streamable_http_lists_and_calls_with_bearer() {
     let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
     let mut secrets = HashMap::new();
     secrets.insert("BEARER_TOKEN".into(), "secret-token".into());
-    let backend = McpConnector::default().connect(&config, &secrets).await.unwrap();
+    let backend = McpConnector::default()
+        .connect(&config, &secrets)
+        .await
+        .unwrap();
     let tools = backend.list_tools().await.unwrap();
     assert_eq!(tools[0].name, "echo");
     let result = backend
@@ -342,7 +345,10 @@ async fn local_stdio_injects_env_and_lists_tools() {
     };
     let mut secrets = HashMap::new();
     secrets.insert("TEST_SECRET".into(), "sk-secret".into());
-    let backend = McpConnector::default().connect(&config, &secrets).await.unwrap();
+    let backend = McpConnector::default()
+        .connect(&config, &secrets)
+        .await
+        .unwrap();
     let tools = backend.list_tools().await.unwrap();
     assert_eq!(tools[0].name, "echo");
     let result = backend.call_tool("echo", json!({ "n": 1 })).await.unwrap();
@@ -364,7 +370,10 @@ async fn local_requires_command() {
         disabled: false,
         tool_permissions: HashMap::new(),
     };
-    let err = match McpConnector::default().connect(&config, &HashMap::new()).await {
+    let err = match McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+    {
         Err(err) => err,
         Ok(_) => panic!("expected InvalidConfig"),
     };
@@ -377,7 +386,10 @@ async fn remote_rejects_plain_http_to_public_host() {
         ServerType::RemoteStreamable,
         "http://example.com/mcp".into(),
     );
-    let err = match McpConnector::default().connect(&config, &HashMap::new()).await {
+    let err = match McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+    {
         Err(err) => err,
         Ok(_) => panic!("expected RemoteUrl"),
     };
@@ -434,10 +446,11 @@ async fn spawn_auth_streamable_opts(
                 let (current_token, refresh_count) = token_state.clone();
                 let auth_headers = auth_headers.clone();
                 async move {
-                    auth_headers
-                        .lock()
-                        .unwrap()
-                        .push(headers.get(header::AUTHORIZATION).map(|value| value.to_str().unwrap().to_string()));
+                    auth_headers.lock().unwrap().push(
+                        headers
+                            .get(header::AUTHORIZATION)
+                            .map(|value| value.to_str().unwrap().to_string()),
+                    );
                     let pairs: HashMap<String, String> =
                         url::form_urlencoded::parse(&form).into_owned().collect();
                     if pairs.get("grant_type").map(String::as_str) == Some("refresh_token") {
@@ -582,12 +595,19 @@ async fn call_tool_refreshes_after_mid_session_rejection() {
     let connector = McpConnector::new(secrets.clone());
     let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
     let backend = connector.connect(&config, &HashMap::new()).await.unwrap();
-    assert_eq!(*refresh_count.lock().unwrap(), 0, "fresh token needs no refresh");
+    assert_eq!(
+        *refresh_count.lock().unwrap(),
+        0,
+        "fresh token needs no refresh"
+    );
 
     // The server rotates its token underneath the live connection.
     *current_token.lock().unwrap() = "at-rotated".into();
 
-    let result = backend.call_tool("echo", json!({ "q": "hi" })).await.unwrap();
+    let result = backend
+        .call_tool("echo", json!({ "q": "hi" }))
+        .await
+        .unwrap();
     let text = result.to_string();
     assert!(text.contains("echo"), "{text}");
     assert_eq!(*refresh_count.lock().unwrap(), 1);
@@ -598,7 +618,13 @@ async fn connect_refreshes_with_client_authentication_for_confidential_clients()
     let fake = spawn_auth_streamable_opts(Some(("cid-static", "sec-static"))).await;
     let secrets = Arc::new(MemorySecretStore::new());
     let two_hours_ago = epoch_now().saturating_sub(7200);
-    seed_credentials_as(secrets.as_ref(), "cid-static", "at-initial", 3600, two_hours_ago);
+    seed_credentials_as(
+        secrets.as_ref(),
+        "cid-static",
+        "at-initial",
+        3600,
+        two_hours_ago,
+    );
     // The confidential client identity survives restarts in the keychain;
     // the restore path alone only recovers the public half of it.
     secrets

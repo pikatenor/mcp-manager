@@ -95,19 +95,21 @@ async fn spawn_fake_as_opts(with_registration_endpoint: bool) -> FakeAs {
         )
         .route(
             "/authorize",
-            get(move |Query(params): Query<HashMap<String, String>>| async move {
-                let redirect = params.get("redirect_uri").cloned().unwrap_or_default();
-                let state = params.get("state").cloned().unwrap_or_default();
-                authorize_queries.lock().unwrap().push(params);
-                Response::builder()
-                    .status(StatusCode::FOUND)
-                    .header(
-                        header::LOCATION,
-                        format!("{redirect}?code=auth-code&state={state}"),
-                    )
-                    .body(Body::empty())
-                    .unwrap()
-            }),
+            get(
+                move |Query(params): Query<HashMap<String, String>>| async move {
+                    let redirect = params.get("redirect_uri").cloned().unwrap_or_default();
+                    let state = params.get("state").cloned().unwrap_or_default();
+                    authorize_queries.lock().unwrap().push(params);
+                    Response::builder()
+                        .status(StatusCode::FOUND)
+                        .header(
+                            header::LOCATION,
+                            format!("{redirect}?code=auth-code&state={state}"),
+                        )
+                        .body(Body::empty())
+                        .unwrap()
+                },
+            ),
         )
         .route(
             "/token",

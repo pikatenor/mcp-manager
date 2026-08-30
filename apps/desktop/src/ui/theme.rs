@@ -116,7 +116,10 @@ mod tests {
         assert_eq!(status_color(tokens, ServerStatus::Error), tokens.danger);
         assert_eq!(status_color(tokens, ServerStatus::Starting), tokens.warning);
         assert_eq!(status_color(tokens, ServerStatus::Stopping), tokens.warning);
-        assert_eq!(status_color(tokens, ServerStatus::Stopped), tokens.text_secondary);
+        assert_eq!(
+            status_color(tokens, ServerStatus::Stopped),
+            tokens.text_secondary
+        );
     }
 
     #[test]
