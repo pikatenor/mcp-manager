@@ -36,7 +36,7 @@ axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 http = "1"
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 reqwest = { version = "0.13", default-features = false, features = ["json", "form", "stream", "rustls"] }
 rmcp = { version = "3", default-features = false, features = [
