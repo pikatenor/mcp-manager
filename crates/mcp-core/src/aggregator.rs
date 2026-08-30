@@ -4,6 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use tokio::sync::broadcast;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Tool {
@@ -42,9 +43,19 @@ pub struct RegisteredServer {
     pub backend: Arc<dyn McpBackend>,
 }
 
-#[derive(Default)]
 pub struct Aggregator {
     servers: Vec<RegisteredServer>,
+    tool_list_changes: broadcast::Sender<()>,
+}
+
+impl Default for Aggregator {
+    fn default() -> Self {
+        let (tool_list_changes, _) = broadcast::channel(16);
+        Self {
+            servers: Vec::new(),
+            tool_list_changes,
+        }
+    }
 }
 
 impl Aggregator {
@@ -62,18 +73,31 @@ impl Aggregator {
         } else {
             self.servers.push(server);
         }
+        let _ = self.tool_list_changes.send(());
     }
 
     pub fn set_running(&mut self, id: &str, running: bool) {
         if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
+            if server.running == running {
+                return;
+            }
             server.running = running;
+            let _ = self.tool_list_changes.send(());
         }
     }
 
     pub fn set_tool_permissions(&mut self, id: &str, tool_permissions: HashMap<String, bool>) {
         if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
+            if server.tool_permissions == tool_permissions {
+                return;
+            }
             server.tool_permissions = tool_permissions;
+            let _ = self.tool_list_changes.send(());
         }
+    }
+
+    pub fn subscribe_tool_list_changes(&self) -> broadcast::Receiver<()> {
+        self.tool_list_changes.subscribe()
     }
 
     pub async fn origin_tools(&self, id: &str) -> Result<Vec<Tool>, AggregatorError> {
@@ -256,5 +280,25 @@ mod tests {
             agg.call_tool("docs__missing", json!({})).await.unwrap_err(),
             AggregatorError::UnknownTool("docs__missing".into())
         );
+    }
+
+    #[tokio::test]
+    async fn running_state_changes_notify_tool_list_subscribers() {
+        let backend = FakeBackend::new(vec![tool("search")]);
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: false,
+            tool_permissions: HashMap::new(),
+            backend,
+        });
+        let mut changes = agg.subscribe_tool_list_changes();
+
+        agg.set_running("1", true);
+        changes.recv().await.unwrap();
+
+        agg.set_running("1", false);
+        changes.recv().await.unwrap();
     }
 }

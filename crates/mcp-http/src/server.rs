@@ -1,3 +1,4 @@
+use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -5,9 +6,11 @@ use axum::body::Body;
 use axum::extract::{Extension, Json, State};
 use axum::http::{header, Request, StatusCode};
 use axum::middleware::{from_fn_with_state, Next};
+use axum::response::sse::{Event, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::post;
+use axum::routing::get;
 use axum::Router;
+use futures::stream;
 use mcp_core::{strip_server_prefix, Aggregator, AggregatorError, CallLog, TokenService};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
@@ -44,7 +47,7 @@ pub fn router_with_aggregator(
         call_log,
     };
     Router::new()
-        .route("/mcp", post(mcp_handler))
+        .route("/mcp", get(mcp_listen).post(mcp_handler))
         .route_layer(from_fn_with_state(state.clone(), require_token))
         .with_state(state)
 }
@@ -154,6 +157,27 @@ fn error_kind_of(err: &AggregatorError) -> &'static str {
     }
 }
 
+async fn mcp_listen(State(state): State<AppState>) -> Response {
+    let changes = state.aggregator.lock().await.subscribe_tool_list_changes();
+    let events = stream::unfold(changes, |mut changes| async move {
+        loop {
+            match changes.recv().await {
+                Ok(()) => {
+                    let notification = json!({
+                        "jsonrpc": "2.0",
+                        "method": "notifications/tools/list_changed"
+                    });
+                    let event = Event::default().data(notification.to_string());
+                    return Some((Ok::<_, Infallible>(event), changes));
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    });
+    Sse::new(events).into_response()
+}
+
 async fn mcp_handler(
     State(state): State<AppState>,
     // Always present: require_token runs first in the route layer.
@@ -169,7 +193,7 @@ async fn mcp_handler(
             id,
             json!({
                 "protocolVersion": "2025-03-26",
-                "capabilities": { "tools": {} },
+                "capabilities": { "tools": { "listChanged": true } },
                 "serverInfo": {
                     "name": "mcp-manager",
                     "version": env!("CARGO_PKG_VERSION")
@@ -336,6 +360,32 @@ mod tests {
         )
     }
 
+    fn app_with_docs_server_and_change_handle() -> (Router, String, Arc<AsyncMutex<Aggregator>>) {
+        let mut tokens = TokenService::new();
+        let issued = tokens.issue("cursor");
+        let plaintext = issued.plaintext.clone();
+        let mut aggregator = Aggregator::new();
+        aggregator.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: Default::default(),
+            backend: Arc::new(FakeBackend {
+                tools: vec![Tool {
+                    name: "search".into(),
+                    description: Some("search docs".into()),
+                }],
+            }),
+        });
+        let aggregator = Arc::new(AsyncMutex::new(aggregator));
+        let app = router_with_aggregator(
+            Arc::new(Mutex::new(tokens)),
+            aggregator.clone(),
+            Arc::new(CallLog::memory().unwrap()),
+        );
+        (app, plaintext, aggregator)
+    }
+
     fn app_with_failing_server() -> (Router, String, Arc<CallLog>) {
         let mut tokens = TokenService::new();
         let issued = tokens.issue("cursor");
@@ -432,8 +482,45 @@ mod tests {
         assert_eq!(json["jsonrpc"], "2.0");
         assert_eq!(json["id"], 1);
         assert_eq!(json["result"]["serverInfo"]["name"], "mcp-manager");
-        assert!(json["result"]["capabilities"]["tools"].is_object());
+        assert_eq!(json["result"]["capabilities"]["tools"]["listChanged"], true);
         assert!(json["result"]["protocolVersion"].as_str().is_some());
+    }
+
+    #[tokio::test]
+    async fn get_stream_emits_tool_list_changed_notification() {
+        let (app, token, aggregator) = app_with_docs_server_and_change_handle();
+        let response = app
+            .oneshot(
+                Request::get("/mcp")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .header(header::ACCEPT, "text/event-stream")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            "text/event-stream"
+        );
+
+        aggregator.lock().await.set_running("1", false);
+
+        let frame = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            response.into_body().frame(),
+        )
+        .await
+        .expect("notification timed out")
+        .expect("notification stream ended")
+        .expect("notification body failed");
+        let data = frame.into_data().expect("expected notification data");
+        let event = String::from_utf8(data.to_vec()).unwrap();
+        assert!(
+            event.contains(r#""method":"notifications/tools/list_changed""#),
+            "{event}"
+        );
     }
 
     #[tokio::test]
