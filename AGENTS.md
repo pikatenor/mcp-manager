@@ -9,7 +9,6 @@ This file is the working contract for agents in this repo. Product overview and 
 
 ## Crate boundaries
 
-
 | Crate          | May contain                                                                          | Must not contain                        |
 | -------------- | ------------------------------------------------------------------------------------ | --------------------------------------- |
 | `mcp-core`     | Models, aggregator, SQLite (no secret *values*), URL SSRF checks, SSE endpoint parse | `target_os`, keychain, browser, reqwest |
@@ -34,8 +33,9 @@ Default workflow for crates:
 1. Write tests for the expected I/O. No production implementation yet (`unimplemented!()` is fine).
 2. Run tests; confirm they fail for the right reason.
 3. Implement until tests pass. **Do not change those tests** while implementing.
-4. Commit the implementation and tests (short why-focused message).
-5. `cargo clippy --all-targets -- -D warnings` on touched crates.
+4. Run `cargo fmt`.
+5. Commit the implementation and tests (short why-focused message).
+6. `cargo clippy --all-targets -- -D warnings` on touched crates.
 
 UI wiring is a thin shell over crate APIs; still keep crate logic test-first.
 
@@ -44,11 +44,11 @@ UI wiring is a thin shell over crate APIs; still keep crate logic test-first.
 - Commits are the smallest revertible deploy unit. Message: 1–2 sentences, **why** not a file list.
 - Background belongs in the PR/issue or `tmp-docs/`, not in the commit body.
 
-
-
 ## Commands
 
 ```bash
+cargo fmt
+cargo fmt --check
 cargo test
 cargo test -p mcp-core --lib
 cargo test -p mcp-http
@@ -57,7 +57,7 @@ cargo clippy --all-targets -- -D warnings
 cargo run -p mcp-manager
 ```
 
-Lint for this repo is **clippy**, not golangci-lint.
+Lint for this repo is **clippy**. Formatting is **rustfmt** (style edition 2024); CI auto-commits `cargo fmt` fixes to your branch, so run it before pushing rather than waiting for the bot.
 
 ## Do not
 
