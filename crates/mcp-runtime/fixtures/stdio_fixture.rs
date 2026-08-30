@@ -30,7 +30,11 @@ fn main() {
                 "tools": [{
                     "name": "echo",
                     "description": "echo",
-                    "inputSchema": { "type": "object", "properties": {} }
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": { "q": { "type": "string", "description": "query" } },
+                        "required": ["q"]
+                    }
                 }]
             }),
             "tools/call" => {

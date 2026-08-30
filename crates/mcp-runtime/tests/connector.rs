@@ -36,7 +36,11 @@ fn handle_mcp(body: Value) -> Response {
             "tools": [{
                 "name": "echo",
                 "description": "echo",
-                "inputSchema": { "type": "object", "properties": {} }
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "q": { "type": "string", "description": "query" } },
+                    "required": ["q"]
+                }
             }]
         }),
         "tools/call" => json!({
@@ -267,6 +271,59 @@ async fn sse_remote_lists_tools() {
         .unwrap();
     let tools = backend.list_tools().await.unwrap();
     assert_eq!(tools[0].name, "echo");
+}
+
+fn assert_echo_schema(tool: &mcp_core::Tool) {
+    assert_eq!(tool.input_schema["type"], "object");
+    assert_eq!(tool.input_schema["properties"]["q"]["type"], "string");
+    assert_eq!(tool.input_schema["properties"]["q"]["description"], "query");
+    assert_eq!(tool.input_schema["required"][0], "q");
+}
+
+#[tokio::test]
+async fn streamable_http_preserves_input_schema() {
+    let addr = spawn_streamable(None).await;
+    let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
+    let backend = McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+        .unwrap();
+    let tools = backend.list_tools().await.unwrap();
+    assert_echo_schema(&tools[0]);
+}
+
+#[tokio::test]
+async fn sse_remote_preserves_input_schema() {
+    let addr = spawn_sse().await;
+    let config = remote_config(ServerType::Remote, format!("http://{addr}/sse"));
+    let backend = McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+        .unwrap();
+    let tools = backend.list_tools().await.unwrap();
+    assert_echo_schema(&tools[0]);
+}
+
+#[tokio::test]
+async fn local_stdio_preserves_input_schema() {
+    let config = ServerConfig {
+        id: "local".into(),
+        name: "fixture".into(),
+        server_type: ServerType::Local,
+        command: Some(env!("CARGO_BIN_EXE_stdio_fixture").into()),
+        args: vec![],
+        env_keys: vec![],
+        remote_url: None,
+        auto_start: false,
+        disabled: false,
+        tool_permissions: HashMap::new(),
+    };
+    let backend = McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+        .unwrap();
+    let tools = backend.list_tools().await.unwrap();
+    assert_echo_schema(&tools[0]);
 }
 
 #[tokio::test]

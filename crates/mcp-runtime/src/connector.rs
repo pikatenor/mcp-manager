@@ -6,8 +6,9 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use http::{HeaderName, HeaderValue};
 use mcp_core::{
-    parse_sse_message_events, validate_remote_url, AggregatorError, BackendConnector, McpBackend,
-    RegistryError, ServerConfig, ServerType, SseClientTransport, Tool,
+    empty_input_schema, parse_sse_message_events, validate_remote_url, AggregatorError,
+    BackendConnector, McpBackend, RegistryError, ServerConfig, ServerType, SseClientTransport,
+    Tool,
 };
 use mcp_platform::SecretStore;
 use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
@@ -77,6 +78,7 @@ impl McpBackend for RmcpBackend {
             .map(|tool| Tool {
                 name: tool.name.to_string(),
                 description: tool.description.map(|description| description.to_string()),
+                input_schema: Value::Object(tool.input_schema.as_ref().clone()),
             })
             .collect())
     }
@@ -562,6 +564,11 @@ fn tools_from_result(result: Value) -> Vec<Tool> {
                     .get("description")
                     .and_then(Value::as_str)
                     .map(str::to_string),
+                input_schema: tool
+                    .get("inputSchema")
+                    .filter(|schema| schema.is_object())
+                    .cloned()
+                    .unwrap_or_else(empty_input_schema),
             })
         })
         .collect()
@@ -662,5 +669,47 @@ impl BackendConnector for McpConnector {
             ServerType::Remote => std::sync::Arc::new(connect_sse(require_url()?, secrets).await?),
         };
         Ok(backend)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tools_from_result_keeps_input_schema() {
+        let result = json!({
+            "tools": [{
+                "name": "echo",
+                "description": "echo",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } },
+                    "required": ["q"]
+                }
+            }]
+        });
+
+        let tools = tools_from_result(result);
+
+        assert_eq!(tools[0].input_schema["type"], "object");
+        assert_eq!(tools[0].input_schema["properties"]["q"]["type"], "string");
+        assert_eq!(tools[0].input_schema["required"][0], "q");
+    }
+
+    #[test]
+    fn tools_from_result_defaults_missing_or_malformed_schema() {
+        let result = json!({
+            "tools": [
+                { "name": "no_schema", "description": "bare" },
+                { "name": "bad_schema", "inputSchema": "not an object" }
+            ]
+        });
+
+        let tools = tools_from_result(result);
+
+        let empty = json!({ "type": "object", "properties": {} });
+        assert_eq!(tools[0].input_schema, empty);
+        assert_eq!(tools[1].input_schema, empty);
     }
 }

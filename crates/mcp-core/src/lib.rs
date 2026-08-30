@@ -17,7 +17,8 @@ pub mod store;
 pub mod token;
 
 pub use aggregator::{
-    AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer, Tool,
+    empty_input_schema, AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer,
+    Tool,
 };
 pub use call_log::{CallLog, ToolCallEntry};
 pub use mcp_json::{parse_mcp_servers, ImportedServer, ParsedImport};
