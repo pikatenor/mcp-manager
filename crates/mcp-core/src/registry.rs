@@ -412,6 +412,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn start_and_stop_notify_tool_list_subscribers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
+                .unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        let aggregator = registry.aggregator();
+        let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
+
+        registry.start("srv-1", HashMap::new()).await.unwrap();
+        changes.recv().await.unwrap();
+
+        registry.stop("srv-1").await.unwrap();
+        changes.recv().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn auto_start_skips_disabled_and_manual_servers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
