@@ -9,13 +9,15 @@ use super::styles::{self, CARD_PADDING};
 use super::{card, danger_button, pane_heading, primary_button, secondary, SEMIBOLD};
 
 pub(crate) fn view(app: &App) -> Element<'_, Message> {
-    let mut heading = row![pane_heading("Client tokens", app.tokens.len()), space::horizontal()]
-        .spacing(10)
-        .align_y(Alignment::Center);
+    let mut heading = row![
+        pane_heading("Client tokens", app.tokens.len()),
+        space::horizontal()
+    ]
+    .spacing(10)
+    .align_y(Alignment::Center);
     if app.tokens.iter().any(|token| token.revoked_at.is_some()) {
-        heading = heading.push(
-            danger_button("Clear revoked").on_press(Message::ClearRevokedTokens),
-        );
+        heading =
+            heading.push(danger_button("Clear revoked").on_press(Message::ClearRevokedTokens));
     }
     let mut body = column![heading].spacing(16);
 
@@ -49,22 +51,16 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     }
 
     for token in &app.tokens {
-        let mut line = row![
-            text(&token.client_name).size(14),
-            space::horizontal(),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
+        let mut line = row![text(&token.client_name).size(14), space::horizontal(),]
+            .spacing(8)
+            .align_y(Alignment::Center);
 
         if token.revoked_at.is_some() {
             line = line.push(secondary("revoked"));
-            line = line.push(
-                danger_button("Delete").on_press(Message::DeleteToken(token.id.clone())),
-            );
+            line =
+                line.push(danger_button("Delete").on_press(Message::DeleteToken(token.id.clone())));
         } else {
-            line = line.push(
-                danger_button("Revoke").on_press(Message::Revoke(token.id.clone())),
-            );
+            line = line.push(danger_button("Revoke").on_press(Message::Revoke(token.id.clone())));
         }
 
         body = body.push(card(line));
@@ -94,9 +90,12 @@ fn secret_banner(plaintext: &str) -> container::Container<'_, Message> {
             text("Copy this secret now \u{2014} it will not be shown again")
                 .size(13)
                 .font(SEMIBOLD),
-            row![secret, primary_button("Copy").on_press(Message::CopyPlaintext),]
-                .spacing(8)
-                .align_y(Alignment::Center),
+            row![
+                secret,
+                primary_button("Copy").on_press(Message::CopyPlaintext),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center),
         ]
         .spacing(10),
     )

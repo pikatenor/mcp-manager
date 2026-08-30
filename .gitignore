@@ -13,6 +13,3 @@ node_modules/
 # Env / secrets
 .env
 .env.*
-
-# Local reference clone of mcp-router (not part of this repo)
-__reference/

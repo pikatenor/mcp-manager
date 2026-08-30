@@ -12,14 +12,14 @@ use mcp_runtime::McpConnector;
 
 use crate::session::{parse_env, AddServerRequest, ImportOutcome, ServerToolView, Session};
 use crate::shell::{on_close_requested, ShellAction};
-use crate::ui;
 #[cfg(target_os = "macos")]
 use crate::shell::{on_tray, parse_tray_menu_id};
+use crate::ui;
 
-#[cfg(target_os = "macos")]
-use mcp_platform::{BundleSecretStore, KeychainSecretStore};
 #[cfg(not(target_os = "macos"))]
 use mcp_platform::MemorySecretStore;
+#[cfg(target_os = "macos")]
+use mcp_platform::{BundleSecretStore, KeychainSecretStore};
 
 pub fn run() -> iced::Result {
     #[cfg(target_os = "macos")]
@@ -368,10 +368,7 @@ fn legacy_secret_store() -> Option<Arc<dyn SecretStore>> {
 }
 
 /// The one-time jobs this binary knows about, in registration order.
-fn desktop_migrations<'a>(
-    session: &'a Session,
-    legacy: &'a dyn SecretStore,
-) -> Vec<Migration<'a>> {
+fn desktop_migrations<'a>(session: &'a Session, legacy: &'a dyn SecretStore) -> Vec<Migration<'a>> {
     vec![Migration {
         name: "0001-fold-legacy-secrets-into-single-item",
         run: Box::pin(session.migrate_legacy_secrets(legacy)),
@@ -417,7 +414,8 @@ impl App {
         let aggregator = session.aggregator();
         let call_log = session.call_log();
         let http: Task<Message> = Task::future(async move {
-            if let Err(error) = mcp_http::serve_with_aggregator(tokens, aggregator, call_log).await {
+            if let Err(error) = mcp_http::serve_with_aggregator(tokens, aggregator, call_log).await
+            {
                 eprintln!("mcp http server failed: {error}");
             }
         })
@@ -462,7 +460,8 @@ impl App {
                 // Migrations precede auto-start: servers must not read the
                 // store before update-time jobs have finished moving state.
                 if let Some(legacy) = legacy.as_deref() {
-                    for outcome in run_pending(&migrations, desktop_migrations(&session, legacy)).await
+                    for outcome in
+                        run_pending(&migrations, desktop_migrations(&session, legacy)).await
                     {
                         match outcome {
                             MigrationOutcome::Applied(name) => {
@@ -491,7 +490,10 @@ impl App {
 
     fn load_logs(&self) -> Task<Message> {
         let session = self.session.clone();
-        Task::perform(async move { session.list_tool_calls(LOG_ROWS) }, Message::LogsLoaded)
+        Task::perform(
+            async move { session.list_tool_calls(LOG_ROWS) },
+            Message::LogsLoaded,
+        )
     }
 
     fn apply_shell(&self, action: ShellAction) -> Task<Message> {
@@ -774,10 +776,13 @@ impl App {
             },
             Message::ClearLogs => {
                 let session = self.session.clone();
-                Task::perform(async move { session.clear_tool_calls() }, |result| match result {
-                    Ok(()) => Message::RefreshLogs,
-                    Err(error) => Message::OpDone(Err(error)),
-                })
+                Task::perform(
+                    async move { session.clear_tool_calls() },
+                    |result| match result {
+                        Ok(()) => Message::RefreshLogs,
+                        Err(error) => Message::OpDone(Err(error)),
+                    },
+                )
             }
             Message::ServerName(value) => {
                 self.server_name = value;
@@ -931,8 +936,7 @@ impl App {
         // Live refresh only while the log pane is visible.
         if app.section == Section::Logs {
             subscriptions.push(
-                iced::time::every(std::time::Duration::from_secs(5))
-                    .map(|_| Message::RefreshLogs),
+                iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::RefreshLogs),
             );
         }
         Subscription::batch(subscriptions)
@@ -940,35 +944,35 @@ impl App {
 
     fn view(&self, _window: window::Id) -> Element<'_, Message> {
         let loaded_tools: usize = self.tools_by_server.values().map(Vec::len).sum();
-        let top_bar = container(
-            row![
-                text("MCP Manager").size(15).font(ui::SEMIBOLD),
-                space::horizontal(),
-                container(
-                    text(format!("{loaded_tools} tools loaded"))
-                        .size(12)
-                        .style(|theme| text::Style {
-                            color: Some(ui::theme::of(theme).text_secondary),
-                        }),
-                )
-                .padding([6, 10]),
-                container(
-                    text(&self.endpoint).size(12).font(Font::MONOSPACE).style(
+        let top_bar =
+            container(
+                row![
+                    text("MCP Manager").size(15).font(ui::SEMIBOLD),
+                    space::horizontal(),
+                    container(text(format!("{loaded_tools} tools loaded")).size(12).style(
                         |theme| text::Style {
                             color: Some(ui::theme::of(theme).text_secondary),
-                        },
-                    ),
-                )
-                .padding([6, 10])
-                .style(ui::styles::chip),
-                ui::secondary_button("Copy").on_press(Message::CopyEndpoint),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-        )
-        .padding([10, 16])
-        .width(Length::Fill)
-        .style(ui::styles::top_bar);
+                        }
+                    ),)
+                    .padding([6, 10]),
+                    container(
+                        text(&self.endpoint)
+                            .size(12)
+                            .font(Font::MONOSPACE)
+                            .style(|theme| text::Style {
+                                color: Some(ui::theme::of(theme).text_secondary),
+                            },),
+                    )
+                    .padding([6, 10])
+                    .style(ui::styles::chip),
+                    ui::secondary_button("Copy").on_press(Message::CopyEndpoint),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+            )
+            .padding([10, 16])
+            .width(Length::Fill)
+            .style(ui::styles::top_bar);
 
         let mut sidebar_content = column![].spacing(12);
         sidebar_content = sidebar_content.push(

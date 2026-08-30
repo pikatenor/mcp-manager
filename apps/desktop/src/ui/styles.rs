@@ -133,12 +133,7 @@ fn filled(fill: Color, hover: Color, text: Color, status: button::Status) -> but
     }
 }
 
-fn outlined(
-    tokens: &Tokens,
-    text: Color,
-    border: Color,
-    status: button::Status,
-) -> button::Style {
+fn outlined(tokens: &Tokens, text: Color, border: Color, status: button::Status) -> button::Style {
     let base = button::Style {
         background: None,
         text_color: text,
@@ -183,9 +178,11 @@ pub(crate) fn nav(selected: bool) -> impl Fn(&Theme, button::Status) -> button::
         };
         match status {
             button::Status::Hovered | button::Status::Pressed => button::Style {
-                background: Some(Background::Color(
-                    if selected { tinted(tokens.accent, 0.22) } else { tokens.surface_hover },
-                )),
+                background: Some(Background::Color(if selected {
+                    tinted(tokens.accent, 0.22)
+                } else {
+                    tokens.surface_hover
+                })),
                 ..base
             },
             button::Status::Disabled | button::Status::Active => base,

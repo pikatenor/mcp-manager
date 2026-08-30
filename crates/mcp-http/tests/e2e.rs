@@ -130,12 +130,7 @@ async fn e2e_call_log_records_tools_call_over_tcp() {
     // No servers registered: the call fails as unknown, and that failure is
     // what gets recorded with the bearer client's name.
     let call = r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"docs__search","arguments":{}}}"#;
-    let (status, body) = post_mcp(
-        addr,
-        Some(&format!("Bearer {}", issued.plaintext)),
-        call,
-    )
-    .await;
+    let (status, body) = post_mcp(addr, Some(&format!("Bearer {}", issued.plaintext)), call).await;
     assert_eq!(status, 200);
     assert!(body.contains("error"), "{body}");
 

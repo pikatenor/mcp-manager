@@ -184,9 +184,7 @@ impl OAuthFlow {
                     let tx = tx.clone();
                     let redirect = redirect.clone();
                     async move {
-                        if let Some(sender) =
-                            tx.lock().ok().and_then(|mut slot| slot.take())
-                        {
+                        if let Some(sender) = tx.lock().ok().and_then(|mut slot| slot.take()) {
                             let _ = sender.send(callback_url(&redirect, &query));
                         }
                         "Authorization complete. You can close this window."
@@ -198,8 +196,9 @@ impl OAuthFlow {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut manager =
-            AuthorizationManager::new(mcp_url.to_string()).await.map_err(auth_error)?;
+        let mut manager = AuthorizationManager::new(mcp_url.to_string())
+            .await
+            .map_err(auth_error)?;
         manager.set_credential_store(KeychainCredentialStore::new(
             self.secrets.clone(),
             server_id,

@@ -16,8 +16,8 @@ use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::auth::{AuthError, AuthorizationManager, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
-    SseError, StreamableHttpError, StreamableHttpPostResponse, StreamableHttpClient,
-    StreamableHttpClientTransportConfig,
+    SseError, StreamableHttpClient, StreamableHttpClientTransportConfig, StreamableHttpError,
+    StreamableHttpPostResponse,
 };
 use rmcp::transport::StreamableHttpClientTransport;
 use rmcp::{serve_client, ClientHandler};

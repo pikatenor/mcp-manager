@@ -66,7 +66,9 @@ pub struct ServerRegistry {
 fn validate_config(config: &ServerConfig) -> Result<(), RegistryError> {
     let name = config.name.trim();
     if name.is_empty() {
-        return Err(RegistryError::InvalidConfig("server name is required".into()));
+        return Err(RegistryError::InvalidConfig(
+            "server name is required".into(),
+        ));
     }
     if name.contains(crate::naming::TOOL_DELIMITER) {
         return Err(RegistryError::InvalidConfig(format!(
@@ -123,9 +125,12 @@ impl ServerRegistry {
         exclude_id: Option<&str>,
     ) -> Result<(), RegistryError> {
         let name = name.trim();
-        if self.store.list()?.iter().any(|config| {
-            Some(config.id.as_str()) != exclude_id && config.name.trim() == name
-        }) {
+        if self
+            .store
+            .list()?
+            .iter()
+            .any(|config| Some(config.id.as_str()) != exclude_id && config.name.trim() == name)
+        {
             return Err(RegistryError::DuplicateName(name.to_string()));
         }
         Ok(())
@@ -560,7 +565,9 @@ mod tests {
         let path = dir.path().join("state.db");
         let mut registry =
             ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
-        let err = registry.add(local_config("srv-1", "bad__name")).unwrap_err();
+        let err = registry
+            .add(local_config("srv-1", "bad__name"))
+            .unwrap_err();
         assert!(matches!(err, RegistryError::InvalidConfig(_)));
     }
 

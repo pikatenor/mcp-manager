@@ -246,7 +246,10 @@ mod tests {
         store.set_many(&values).unwrap();
 
         assert_eq!(counting.sets.load(Ordering::SeqCst), 1);
-        assert_eq!(store.get("server:a:bearer").unwrap().as_deref(), Some("tok"));
+        assert_eq!(
+            store.get("server:a:bearer").unwrap().as_deref(),
+            Some("tok")
+        );
         assert_eq!(store.get("server:a:env:K").unwrap().as_deref(), Some("v"));
     }
 
@@ -282,9 +285,7 @@ mod tests {
     #[test]
     fn corrupt_bundle_fails_closed() {
         let memory = Arc::new(MemorySecretStore::new());
-        memory
-            .set(DEFAULT_BUNDLE_ACCOUNT, "not a bundle")
-            .unwrap();
+        memory.set(DEFAULT_BUNDLE_ACCOUNT, "not a bundle").unwrap();
         let store = BundleSecretStore::new(memory.clone());
 
         assert!(store.get("server:srv:bearer").is_err());
