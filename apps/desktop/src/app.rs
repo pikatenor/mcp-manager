@@ -15,6 +15,7 @@ use crate::shell::{on_close_requested, ShellAction};
 #[cfg(target_os = "macos")]
 use crate::shell::{on_tray, parse_tray_menu_id};
 use crate::ui;
+use crate::version;
 
 #[cfg(not(target_os = "macos"))]
 use mcp_platform::MemorySecretStore;
@@ -1040,9 +1041,7 @@ impl App {
             .spacing(2),
         );
         sidebar_content = sidebar_content.push(space::vertical());
-        sidebar_content = sidebar_content.push(ui::secondary(
-            "Closing this window hides the app to the menu bar.",
-        ));
+        sidebar_content = sidebar_content.push(ui::secondary(version::sidebar_version()));
 
         let sidebar = container(sidebar_content.padding(12))
             .width(Length::Fixed(216.0))

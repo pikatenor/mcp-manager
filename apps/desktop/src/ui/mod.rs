@@ -22,7 +22,7 @@ pub(crate) const SEMIBOLD: Font = Font {
 };
 
 /// Secondary-size, secondary-color text for hints and metadata.
-pub(crate) fn secondary(label: &str) -> text::Text<'_> {
+pub(crate) fn secondary<'a>(label: impl IntoFragment<'a>) -> text::Text<'a> {
     text(label).size(13).style(|theme| text::Style {
         color: Some(theme::of(theme).text_secondary),
     })
