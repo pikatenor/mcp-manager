@@ -29,12 +29,21 @@ fn main() {
             "tools/list" => json!({
                 "tools": [{
                     "name": "echo",
+                    "title": "Echo Chamber",
                     "description": "echo",
                     "inputSchema": {
                         "type": "object",
                         "properties": { "q": { "type": "string", "description": "query" } },
                         "required": ["q"]
-                    }
+                    },
+                    "outputSchema": {
+                        "type": "object",
+                        "properties": { "echoed": { "type": "string" } },
+                        "required": ["echoed"]
+                    },
+                    "annotations": { "readOnlyHint": true },
+                    "icons": [{ "src": "https://example.com/echo.png", "mimeType": "image/png" }],
+                    "_meta": { "fixture": "connector" }
                 }]
             }),
             "tools/call" => {

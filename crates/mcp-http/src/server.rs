@@ -210,14 +210,13 @@ async fn mcp_handler(
             let aggregator = state.aggregator.lock().await;
             match aggregator.list_tools().await {
                 Ok(tools) => {
+                    // AggregatedTool serializes as exactly an MCP Tool wire
+                    // object, so upstream metadata forwards verbatim.
                     let tools: Vec<Value> = tools
                         .into_iter()
                         .map(|tool| {
-                            json!({
-                                "name": tool.name,
-                                "description": tool.description.unwrap_or_default(),
-                                "inputSchema": tool.input_schema
-                            })
+                            serde_json::to_value(&tool)
+                                .expect("AggregatedTool serializes as an MCP Tool object")
                         })
                         .collect();
                     jsonrpc_ok(id, json!({ "tools": tools }))
@@ -306,8 +305,13 @@ mod tests {
         async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
             Ok(vec![Tool {
                 name: "boom".into(),
+                title: None,
                 description: None,
                 input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+                output_schema: None,
+                annotations: None,
+                icons: None,
+                meta: None,
             }])
         }
 
@@ -353,12 +357,21 @@ mod tests {
             backend: Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
+                    title: Some("Docs Search".into()),
                     description: Some("search docs".into()),
                     input_schema: json!({
                         "type": "object",
                         "properties": { "q": { "type": "string" } },
                         "required": ["q"]
                     }),
+                    output_schema: Some(json!({
+                        "type": "object",
+                        "properties": { "hits": { "type": "array" } },
+                        "required": ["hits"]
+                    })),
+                    annotations: Some(json!({ "readOnlyHint": true })),
+                    icons: Some(json!([{ "src": "https://example.com/search.png" }])),
+                    meta: Some(json!({ "fixture": "docs" })),
                 }],
             }),
         });
@@ -387,12 +400,17 @@ mod tests {
             backend: Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
+                    title: None,
                     description: Some("search docs".into()),
                     input_schema: json!({
                         "type": "object",
                         "properties": { "q": { "type": "string" } },
                         "required": ["q"]
                     }),
+                    output_schema: None,
+                    annotations: None,
+                    icons: None,
+                    meta: None,
                 }],
             }),
         });
@@ -445,6 +463,20 @@ mod tests {
         let json = serde_json::from_slice(&bytes)
             .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&bytes) }));
         (status, json)
+    }
+
+    async fn list_tools(app: Router, token: &str) -> (StatusCode, Value) {
+        post_mcp(
+            app,
+            token,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/list",
+                "params": {}
+            }),
+        )
+        .await
     }
 
     #[tokio::test]
@@ -545,17 +577,7 @@ mod tests {
     #[tokio::test]
     async fn tools_list_returns_prefixed_names() {
         let (app, token, _) = app_with_docs_server();
-        let (status, json) = post_mcp(
-            app,
-            &token,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/list",
-                "params": {}
-            }),
-        )
-        .await;
+        let (status, json) = list_tools(app, &token).await;
         assert_eq!(status, StatusCode::OK);
         let names: Vec<&str> = json["result"]["tools"]
             .as_array()
@@ -569,22 +591,43 @@ mod tests {
     #[tokio::test]
     async fn tools_list_returns_input_schema() {
         let (app, token, _) = app_with_docs_server();
-        let (status, json) = post_mcp(
-            app,
-            &token,
-            json!({
-                "jsonrpc": "2.0",
-                "id": 2,
-                "method": "tools/list",
-                "params": {}
-            }),
-        )
-        .await;
+        let (status, json) = list_tools(app, &token).await;
         assert_eq!(status, StatusCode::OK);
         let schema = &json["result"]["tools"][0]["inputSchema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["properties"]["q"]["type"], "string");
         assert_eq!(schema["required"][0], "q");
+    }
+
+    #[tokio::test]
+    async fn tools_list_returns_tool_metadata() {
+        let (app, token, _) = app_with_docs_server();
+        let (_, json) = list_tools(app, &token).await;
+        let tool = &json["result"]["tools"][0];
+        assert_eq!(tool["title"], "Docs Search");
+        assert_eq!(tool["description"], "search docs");
+        assert_eq!(tool["outputSchema"]["required"][0], "hits");
+        assert_eq!(tool["annotations"]["readOnlyHint"], true);
+        assert_eq!(tool["icons"][0]["src"], "https://example.com/search.png");
+        assert_eq!(tool["_meta"]["fixture"], "docs");
+    }
+
+    #[tokio::test]
+    async fn tools_list_omits_absent_optional_fields() {
+        let (app, token, _) = app_with_failing_server();
+        let (_, json) = list_tools(app, &token).await;
+        let tool = &json["result"]["tools"][0];
+        assert_eq!(tool["name"], "flaky__boom");
+        for key in [
+            "title",
+            "description",
+            "outputSchema",
+            "annotations",
+            "icons",
+            "_meta",
+        ] {
+            assert!(tool.get(key).is_none(), "{key} should be omitted");
+        }
     }
 
     fn call_body(id: i64, name: &str, arguments: Value) -> Value {

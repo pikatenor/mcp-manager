@@ -35,12 +35,21 @@ fn handle_mcp(body: Value) -> Response {
         "tools/list" => json!({
             "tools": [{
                 "name": "echo",
+                "title": "Echo Chamber",
                 "description": "echo",
                 "inputSchema": {
                     "type": "object",
                     "properties": { "q": { "type": "string", "description": "query" } },
                     "required": ["q"]
-                }
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": { "echoed": { "type": "string" } },
+                    "required": ["echoed"]
+                },
+                "annotations": { "readOnlyHint": true },
+                "icons": [{ "src": "https://example.com/echo.png", "mimeType": "image/png" }],
+                "_meta": { "fixture": "connector" }
             }]
         }),
         "tools/call" => json!({
@@ -283,6 +292,21 @@ fn assert_echo_schema(tool: &mcp_core::Tool) {
     assert_eq!(tool.input_schema["required"][0], "q");
 }
 
+fn assert_echo_tool_metadata(tool: &mcp_core::Tool) {
+    assert_echo_schema(tool);
+    assert_eq!(tool.title.as_deref(), Some("Echo Chamber"));
+    assert_eq!(
+        tool.output_schema.as_ref().unwrap()["required"][0],
+        "echoed"
+    );
+    assert_eq!(tool.annotations.as_ref().unwrap()["readOnlyHint"], true);
+    assert_eq!(
+        tool.icons.as_ref().unwrap()[0]["src"],
+        "https://example.com/echo.png"
+    );
+    assert_eq!(tool.meta.as_ref().unwrap()["fixture"], "connector");
+}
+
 #[tokio::test]
 async fn streamable_http_preserves_input_schema() {
     let addr = spawn_streamable(None).await;
@@ -292,7 +316,7 @@ async fn streamable_http_preserves_input_schema() {
         .await
         .unwrap();
     let tools = backend.list_tools().await.unwrap();
-    assert_echo_schema(&tools[0]);
+    assert_echo_tool_metadata(&tools[0]);
 }
 
 #[tokio::test]
@@ -304,7 +328,7 @@ async fn sse_remote_preserves_input_schema() {
         .await
         .unwrap();
     let tools = backend.list_tools().await.unwrap();
-    assert_echo_schema(&tools[0]);
+    assert_echo_tool_metadata(&tools[0]);
 }
 
 #[tokio::test]
@@ -326,7 +350,7 @@ async fn local_stdio_preserves_input_schema() {
         .await
         .unwrap();
     let tools = backend.list_tools().await.unwrap();
-    assert_echo_schema(&tools[0]);
+    assert_echo_tool_metadata(&tools[0]);
 }
 
 #[tokio::test]

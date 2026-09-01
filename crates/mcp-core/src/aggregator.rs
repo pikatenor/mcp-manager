@@ -15,17 +15,51 @@ pub fn empty_input_schema() -> Value {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Tool {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "inputSchema", default = "empty_input_schema")]
     pub input_schema: Value,
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Value>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
 }
 
+/// An upstream tool under its public `{server}__{tool}` name. Serializes as
+/// exactly an MCP Tool wire object, so the inbound `tools/list` can forward it
+/// verbatim; `source_server` is internal-only.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AggregatedTool {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     #[serde(rename = "inputSchema", default = "empty_input_schema")]
     pub input_schema: Value,
+    #[serde(
+        rename = "outputSchema",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub annotations: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub icons: Option<Value>,
+    #[serde(rename = "_meta", default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<Value>,
+    #[serde(skip_serializing, default)]
     pub source_server: String,
 }
 
@@ -129,8 +163,13 @@ impl Aggregator {
                 }
                 tools.push(AggregatedTool {
                     name: crate::naming::prefix_tool_name(&server.name, &tool.name),
+                    title: tool.title,
                     description: tool.description,
                     input_schema: tool.input_schema,
+                    output_schema: tool.output_schema,
+                    annotations: tool.annotations,
+                    icons: tool.icons,
+                    meta: tool.meta,
                     source_server: server.name.clone(),
                 });
             }
@@ -198,12 +237,17 @@ mod tests {
     fn tool(name: &str) -> Tool {
         Tool {
             name: name.into(),
+            title: None,
             description: Some(format!("{name} desc")),
             input_schema: json!({
                 "type": "object",
                 "properties": { "q": { "type": "string" } },
                 "required": ["q"]
             }),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
         }
     }
 
@@ -254,6 +298,98 @@ mod tests {
                 "required": ["q"]
             })
         );
+    }
+
+    fn metadata_tool(name: &str) -> Tool {
+        Tool {
+            title: Some("Fetch Page".into()),
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": { "html": { "type": "string" } },
+                "required": ["html"]
+            })),
+            annotations: Some(json!({ "readOnlyHint": true })),
+            icons: Some(json!([{ "src": "https://example.com/i.png", "mimeType": "image/png" }])),
+            meta: Some(json!({ "upstream": "tag" })),
+            ..tool(name)
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tools_preserves_tool_metadata() {
+        let backend = FakeBackend::new(vec![metadata_tool("fetch")]);
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: HashMap::new(),
+            backend,
+        });
+
+        let tools = agg.list_tools().await.unwrap();
+        assert_eq!(tools[0].title.as_deref(), Some("Fetch Page"));
+        assert_eq!(
+            tools[0].output_schema.as_ref().unwrap()["required"][0],
+            "html"
+        );
+        assert_eq!(tools[0].annotations.as_ref().unwrap()["readOnlyHint"], true);
+        assert_eq!(
+            tools[0].icons.as_ref().unwrap()[0]["src"],
+            "https://example.com/i.png"
+        );
+        assert_eq!(tools[0].meta.as_ref().unwrap()["upstream"], "tag");
+    }
+
+    #[tokio::test]
+    async fn aggregated_tool_serializes_as_mcp_wire_tool() {
+        let backend = FakeBackend::new(vec![metadata_tool("fetch")]);
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: HashMap::new(),
+            backend,
+        });
+
+        let tools = agg.list_tools().await.unwrap();
+        let value = serde_json::to_value(&tools[0]).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "name": "docs__fetch",
+                "title": "Fetch Page",
+                "description": "fetch desc",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": { "q": { "type": "string" } },
+                    "required": ["q"]
+                },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": { "html": { "type": "string" } },
+                    "required": ["html"]
+                },
+                "annotations": { "readOnlyHint": true },
+                "icons": [{ "src": "https://example.com/i.png", "mimeType": "image/png" }],
+                "_meta": { "upstream": "tag" }
+            })
+        );
+    }
+
+    #[test]
+    fn tool_deserializes_without_optional_fields() {
+        let parsed: Tool =
+            serde_json::from_value(json!({ "name": "bare", "inputSchema": { "type": "object" } }))
+                .unwrap();
+        assert_eq!(parsed.name, "bare");
+        assert_eq!(parsed.title, None);
+        assert_eq!(parsed.description, None);
+        assert_eq!(parsed.output_schema, None);
+        assert_eq!(parsed.annotations, None);
+        assert_eq!(parsed.icons, None);
+        assert_eq!(parsed.meta, None);
     }
 
     #[tokio::test]
