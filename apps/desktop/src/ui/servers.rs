@@ -150,10 +150,7 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
         body = body.push(card(content));
     }
 
-    body.push(secondary(
-        "Local stdio, remote Streamable HTTP, and legacy SSE servers start from this list. Env values and bearer tokens stay in the keychain.",
-    ))
-    .into()
+    body.into()
 }
 
 fn add_form(app: &App) -> iced::widget::Column<'_, Message> {
