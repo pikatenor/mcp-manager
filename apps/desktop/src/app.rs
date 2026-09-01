@@ -261,6 +261,9 @@ pub(crate) struct App {
     pub(crate) plaintext: Option<String>,
     pub(crate) tool_calls: Vec<ToolCallEntry>,
     pub(crate) servers: Vec<ServerState>,
+    /// False until the first snapshot after migrations, so boot does not flash
+    /// an empty-state card while SQLite still has servers.
+    pub(crate) servers_ready: bool,
     pub(crate) tools_by_server: HashMap<String, Vec<ServerToolView>>,
     /// Server ids whose tool list is expanded; lists start collapsed.
     pub(crate) tools_expanded: HashSet<String>,
@@ -329,6 +332,8 @@ pub enum Message {
     ToggleToolList(String),
     Oauth(String),
     Snapshot(Result<Snapshot, String>),
+    /// First snapshot after migrations and `begin_auto_start`; then auto-start connects.
+    StartupListed(Result<Snapshot, String>),
     OpDone(Result<(), String>),
     SnapshotReadyClearForm,
 }
@@ -436,6 +441,7 @@ impl App {
             plaintext: None,
             tool_calls: Vec::new(),
             servers: Vec::new(),
+            servers_ready: false,
             tools_by_server: HashMap::new(),
             tools_expanded: HashSet::new(),
             oauth_by_server: HashMap::new(),
@@ -474,10 +480,12 @@ impl App {
                         }
                     }
                 }
-                session.auto_start().await?;
+                if let Err(error) = session.begin_auto_start().await {
+                    eprintln!("begin auto-start failed: {error}");
+                }
                 load_snapshot(session).await
             },
-            Message::Snapshot,
+            Message::StartupListed,
         );
 
         (app, Task::batch([http, open_main_window(), startup]))
@@ -533,6 +541,33 @@ impl App {
             Ok(()) => self.error = None,
             Err(error) => self.error = Some(error),
         }
+    }
+
+    fn apply_snapshot(&mut self, result: Result<Snapshot, String>) {
+        match result {
+            Ok(snapshot) => {
+                self.tokens = snapshot.tokens;
+                self.servers = snapshot.servers;
+                self.tools_by_server = snapshot.tools;
+                self.oauth_by_server = snapshot.oauth;
+                self.servers_ready = true;
+                self.error = None;
+            }
+            Err(error) => self.error = Some(error),
+        }
+    }
+
+    fn set_server_status(&mut self, id: &str, status: ServerStatus) {
+        if let Some(server) = self.servers.iter_mut().find(|s| s.config.id == id) {
+            server.status = status;
+        }
+    }
+
+    fn server_status(&self, id: &str) -> Option<ServerStatus> {
+        self.servers
+            .iter()
+            .find(|s| s.config.id == id)
+            .map(|s| s.status)
     }
 
     fn clear_form(&mut self) {
@@ -851,6 +886,13 @@ impl App {
                 )
             }
             Message::Start(id) => {
+                if matches!(
+                    self.server_status(&id),
+                    Some(ServerStatus::Starting | ServerStatus::Stopping | ServerStatus::Running)
+                ) {
+                    return Task::none();
+                }
+                self.set_server_status(&id, ServerStatus::Starting);
                 let session = self.session.clone();
                 Task::perform(
                     async move { session.start_server(&id).await },
@@ -858,6 +900,10 @@ impl App {
                 )
             }
             Message::Stop(id) => {
+                if !matches!(self.server_status(&id), Some(ServerStatus::Running)) {
+                    return Task::none();
+                }
+                self.set_server_status(&id, ServerStatus::Stopping);
                 let session = self.session.clone();
                 Task::perform(
                     async move { session.stop_server(&id).await },
@@ -893,26 +939,24 @@ impl App {
                     Message::OpDone,
                 )
             }
+            Message::StartupListed(result) => {
+                self.apply_snapshot(result);
+                let session = self.session.clone();
+                Task::perform(
+                    async move {
+                        let _ = session.auto_start().await;
+                        load_snapshot(session).await
+                    },
+                    Message::Snapshot,
+                )
+            }
             Message::Snapshot(result) => {
-                match result {
-                    Ok(snapshot) => {
-                        self.tokens = snapshot.tokens;
-                        self.servers = snapshot.servers;
-                        self.tools_by_server = snapshot.tools;
-                        self.oauth_by_server = snapshot.oauth;
-                        self.error = None;
-                    }
-                    Err(error) => self.error = Some(error),
-                }
+                self.apply_snapshot(result);
                 Task::none()
             }
             Message::OpDone(result) => {
                 self.set_error(result);
-                if self.error.is_none() {
-                    self.refresh()
-                } else {
-                    Task::none()
-                }
+                self.refresh()
             }
             Message::SnapshotReadyClearForm => {
                 self.clear_form();

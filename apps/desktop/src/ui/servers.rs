@@ -42,12 +42,15 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
     }
 
     if app.servers.is_empty() && !app.show_add_form {
+        let copy = if app.servers_ready {
+            "No servers yet. Add your first MCP server with “+ Add server”."
+        } else {
+            "Loading servers…"
+        };
         body = body.push(card(
-            container(secondary(
-                "No servers yet. Add your first MCP server with “+ Add server”.",
-            ))
-            .width(Length::Fill)
-            .align_x(iced::alignment::Horizontal::Center),
+            container(secondary(copy))
+                .width(Length::Fill)
+                .align_x(iced::alignment::Horizontal::Center),
         ));
     }
 
@@ -82,10 +85,21 @@ pub(crate) fn view(app: &App) -> Element<'_, Message> {
 
         let mut actions = row![].spacing(8);
         actions = actions.push(secondary_button("Edit").on_press(Message::EditServer(id.clone())));
-        if server.status == ServerStatus::Running {
-            actions = actions.push(secondary_button("Stop").on_press(Message::Stop(id.clone())));
-        } else {
-            actions = actions.push(secondary_button("Start").on_press(Message::Start(id.clone())));
+        match server.status {
+            ServerStatus::Running => {
+                actions =
+                    actions.push(secondary_button("Stop").on_press(Message::Stop(id.clone())));
+            }
+            ServerStatus::Stopping => {
+                actions = actions.push(secondary_button("Stop"));
+            }
+            ServerStatus::Starting => {
+                actions = actions.push(secondary_button("Start"));
+            }
+            ServerStatus::Stopped | ServerStatus::Error => {
+                actions =
+                    actions.push(secondary_button("Start").on_press(Message::Start(id.clone())));
+            }
         }
         if server.config.server_type != ServerType::Local {
             let label = if app.oauth_by_server.get(&id).copied().unwrap_or(false) {

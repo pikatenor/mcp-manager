@@ -186,6 +186,53 @@ fn toggle_session() -> (Fixture, Arc<ToggleConnector>) {
     (open_session(toggle.clone()), toggle)
 }
 
+struct GatedConnector {
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl BackendConnector for GatedConnector {
+    async fn connect(
+        &self,
+        _config: &ServerConfig,
+        _secrets: &HashMap<String, String>,
+    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+        if let Some(tx) = self.entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        let rx = self.release.lock().unwrap().take();
+        if let Some(rx) = rx {
+            let _ = rx.await;
+        }
+        Ok(Arc::new(StaticBackend { tools: vec![] }))
+    }
+}
+
+struct FailOnceConnector {
+    remaining: std::sync::atomic::AtomicUsize,
+    seen: std::sync::Mutex<Vec<String>>,
+}
+
+#[async_trait]
+impl BackendConnector for FailOnceConnector {
+    async fn connect(
+        &self,
+        config: &ServerConfig,
+        _secrets: &HashMap<String, String>,
+    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+        self.seen.lock().unwrap().push(config.name.clone());
+        if self
+            .remaining
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            > 0
+        {
+            return Err(RegistryError::Backend("connect failed".into()));
+        }
+        Ok(Arc::new(StaticBackend { tools: vec![] }))
+    }
+}
+
 #[test]
 fn aggregator_endpoint_is_localhost_streamable_http() {
     assert_eq!(Session::aggregator_endpoint(), "http://127.0.0.1:8757/mcp");
@@ -488,6 +535,95 @@ async fn auto_start_starts_flagged_servers() {
         .collect();
     assert_eq!(by_name.get("auto"), Some(&ServerStatus::Running));
     assert_eq!(by_name.get("manual"), Some(&ServerStatus::Stopped));
+}
+
+#[tokio::test]
+async fn list_servers_sees_starting_while_start_is_in_flight() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let fx = open_session(Arc::new(GatedConnector {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    }));
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    let id = config.id.clone();
+    let session = fx.session.clone();
+    let start = tokio::spawn(async move { session.start_server(&id).await });
+    entered_rx.await.unwrap();
+    let listed =
+        tokio::time::timeout(std::time::Duration::from_secs(1), fx.session.list_servers()).await;
+    let _ = release_tx.send(());
+    start.await.unwrap().unwrap();
+    let listed = listed
+        .expect("list_servers should not wait for connect")
+        .unwrap();
+    assert_eq!(listed[0].status, ServerStatus::Starting);
+    assert_eq!(
+        fx.session.list_servers().await.unwrap()[0].status,
+        ServerStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn auto_start_marks_flagged_servers_starting_before_connect() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let fx = open_session(Arc::new(GatedConnector {
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    }));
+    let mut auto = local_add("auto");
+    auto.auto_start = true;
+    let mut manual = local_add("manual");
+    manual.auto_start = false;
+    fx.session.add_server(auto).await.unwrap();
+    fx.session.add_server(manual).await.unwrap();
+
+    let session = fx.session.clone();
+    let auto_start = tokio::spawn(async move { session.auto_start().await });
+    entered_rx.await.unwrap();
+    let listed =
+        tokio::time::timeout(std::time::Duration::from_secs(1), fx.session.list_servers()).await;
+    let _ = release_tx.send(());
+    auto_start.await.unwrap().unwrap();
+    let listed = listed
+        .expect("list_servers should not wait for auto-start connect")
+        .unwrap();
+    let by_name: HashMap<_, _> = listed
+        .into_iter()
+        .map(|state| (state.config.name, state.status))
+        .collect();
+    assert_eq!(by_name.get("auto"), Some(&ServerStatus::Starting));
+    assert_eq!(by_name.get("manual"), Some(&ServerStatus::Stopped));
+}
+
+#[tokio::test]
+async fn auto_start_continues_after_one_connect_failure() {
+    let connector = Arc::new(FailOnceConnector {
+        remaining: std::sync::atomic::AtomicUsize::new(1),
+        seen: std::sync::Mutex::new(Vec::new()),
+    });
+    let fx = open_session(connector.clone());
+    let mut alpha = local_add("alpha");
+    alpha.auto_start = true;
+    let mut beta = local_add("beta");
+    beta.auto_start = true;
+    fx.session.add_server(alpha).await.unwrap();
+    fx.session.add_server(beta).await.unwrap();
+    fx.session.auto_start().await.unwrap();
+
+    let listed = fx.session.list_servers().await.unwrap();
+    let by_name: HashMap<_, _> = listed
+        .into_iter()
+        .map(|state| (state.config.name, state.status))
+        .collect();
+    assert_eq!(by_name.get("alpha"), Some(&ServerStatus::Error));
+    assert_eq!(by_name.get("beta"), Some(&ServerStatus::Running));
+    assert_eq!(*connector.seen.lock().unwrap(), vec!["alpha", "beta"]);
 }
 
 #[tokio::test]
