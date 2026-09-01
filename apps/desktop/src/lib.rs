@@ -7,5 +7,6 @@ mod app;
 #[cfg(target_os = "macos")]
 mod tray;
 mod ui;
+mod version;
 
 pub use app::run;
