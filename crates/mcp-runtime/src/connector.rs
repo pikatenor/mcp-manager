@@ -77,8 +77,22 @@ impl McpBackend for RmcpBackend {
             .into_iter()
             .map(|tool| Tool {
                 name: tool.name.to_string(),
+                title: tool.title.clone(),
                 description: tool.description.map(|description| description.to_string()),
                 input_schema: Value::Object(tool.input_schema.as_ref().clone()),
+                output_schema: tool
+                    .output_schema
+                    .as_ref()
+                    .map(|schema| Value::Object(schema.as_ref().clone())),
+                annotations: tool
+                    .annotations
+                    .as_ref()
+                    .and_then(|annotations| serde_json::to_value(annotations).ok()),
+                icons: tool
+                    .icons
+                    .as_ref()
+                    .and_then(|icons| serde_json::to_value(icons).ok()),
+                meta: tool.meta.as_ref().map(|meta| Value::Object(meta.0.clone())),
             })
             .collect())
     }
@@ -560,6 +574,10 @@ fn tools_from_result(result: Value) -> Vec<Tool> {
         .filter_map(|tool| {
             Some(Tool {
                 name: tool.get("name")?.as_str()?.to_string(),
+                title: tool
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 description: tool
                     .get("description")
                     .and_then(Value::as_str)
@@ -569,6 +587,16 @@ fn tools_from_result(result: Value) -> Vec<Tool> {
                     .filter(|schema| schema.is_object())
                     .cloned()
                     .unwrap_or_else(empty_input_schema),
+                output_schema: tool
+                    .get("outputSchema")
+                    .filter(|schema| schema.is_object())
+                    .cloned(),
+                annotations: tool
+                    .get("annotations")
+                    .filter(|schema| schema.is_object())
+                    .cloned(),
+                icons: tool.get("icons").filter(|icons| icons.is_array()).cloned(),
+                meta: tool.get("_meta").filter(|meta| meta.is_object()).cloned(),
             })
         })
         .collect()
@@ -711,5 +739,57 @@ mod tests {
         let empty = json!({ "type": "object", "properties": {} });
         assert_eq!(tools[0].input_schema, empty);
         assert_eq!(tools[1].input_schema, empty);
+    }
+
+    #[test]
+    fn tools_from_result_keeps_optional_metadata() {
+        let result = json!({
+            "tools": [{
+                "name": "fetch",
+                "title": "Fetch Page",
+                "description": "fetch desc",
+                "inputSchema": { "type": "object", "properties": {} },
+                "outputSchema": {
+                    "type": "object",
+                    "properties": { "html": { "type": "string" } }
+                },
+                "annotations": { "readOnlyHint": true },
+                "icons": [{ "src": "https://example.com/i.png", "mimeType": "image/png" }],
+                "_meta": { "upstream": "tag" }
+            }]
+        });
+
+        let tools = tools_from_result(result);
+
+        assert_eq!(tools[0].title.as_deref(), Some("Fetch Page"));
+        assert_eq!(
+            tools[0].output_schema.as_ref().unwrap()["properties"]["html"]["type"],
+            "string"
+        );
+        assert_eq!(tools[0].annotations.as_ref().unwrap()["readOnlyHint"], true);
+        assert_eq!(tools[0].icons.as_ref().unwrap()[0]["mimeType"], "image/png");
+        assert_eq!(tools[0].meta.as_ref().unwrap()["upstream"], "tag");
+    }
+
+    #[test]
+    fn tools_from_result_defaults_malformed_metadata() {
+        let result = json!({
+            "tools": [{
+                "name": "weird",
+                "title": 42,
+                "outputSchema": "not an object",
+                "annotations": [],
+                "icons": "nope",
+                "_meta": "also not"
+            }]
+        });
+
+        let tools = tools_from_result(result);
+
+        assert_eq!(tools[0].title, None);
+        assert_eq!(tools[0].output_schema, None);
+        assert_eq!(tools[0].annotations, None);
+        assert_eq!(tools[0].icons, None);
+        assert_eq!(tools[0].meta, None);
     }
 }

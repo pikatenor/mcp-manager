@@ -83,8 +83,13 @@ fn session(tools: Vec<Tool>) -> Fixture {
 fn tool(name: &str) -> Tool {
     Tool {
         name: name.into(),
+        title: None,
         description: None,
         input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+        output_schema: None,
+        annotations: None,
+        icons: None,
+        meta: None,
     }
 }
 
