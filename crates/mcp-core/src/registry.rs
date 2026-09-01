@@ -89,6 +89,16 @@ fn validate_config(config: &ServerConfig) -> Result<(), RegistryError> {
     }
 }
 
+fn validate_startable(config: &ServerConfig) -> Result<(), RegistryError> {
+    validate_config(config)?;
+    if config.server_type == ServerType::Local && config.command.is_none() {
+        return Err(RegistryError::InvalidConfig(
+            "command is required for local servers".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl ServerRegistry {
     pub fn open_sqlite(
         path: &Path,
@@ -148,6 +158,10 @@ impl ServerRegistry {
         self.aggregator.clone()
     }
 
+    pub fn connector(&self) -> Arc<dyn BackendConnector> {
+        self.connector.clone()
+    }
+
     pub fn list(&self) -> Result<Vec<ServerState>, RegistryError> {
         Ok(self
             .store
@@ -168,25 +182,29 @@ impl ServerRegistry {
             .collect())
     }
 
-    pub async fn start(
-        &mut self,
-        id: &str,
-        secrets: HashMap<String, String>,
-    ) -> Result<(), RegistryError> {
+    /// Validate and mark the server `Starting` without connecting.
+    pub fn begin_start(&mut self, id: &str) -> Result<ServerConfig, RegistryError> {
         let config = self
             .store
             .get(id)?
             .ok_or_else(|| RegistryError::UnknownServer(id.to_string()))?;
-        validate_config(&config)?;
-        if config.server_type == ServerType::Local && config.command.is_none() {
-            return Err(RegistryError::InvalidConfig(
-                "command is required for local servers".into(),
-            ));
+        if let Err(err) = validate_startable(&config) {
+            self.statuses.insert(config.id.clone(), ServerStatus::Error);
+            self.errors.insert(config.id.clone(), err.to_string());
+            return Err(err);
         }
-
         self.statuses
             .insert(config.id.clone(), ServerStatus::Starting);
-        match self.connector.connect(&config, &secrets).await {
+        Ok(config)
+    }
+
+    /// Record the result of `connector.connect` as `Running` or `Error`.
+    pub async fn finish_start(
+        &mut self,
+        config: &ServerConfig,
+        result: Result<Arc<dyn McpBackend>, RegistryError>,
+    ) -> Result<(), RegistryError> {
+        match result {
             Ok(backend) => {
                 self.aggregator
                     .lock()
@@ -209,6 +227,31 @@ impl ServerRegistry {
                 Err(err)
             }
         }
+    }
+
+    pub async fn start(
+        &mut self,
+        id: &str,
+        secrets: HashMap<String, String>,
+    ) -> Result<(), RegistryError> {
+        let config = self.begin_start(id)?;
+        let result = self.connector.connect(&config, &secrets).await;
+        self.finish_start(&config, result).await
+    }
+
+    /// Mark every `auto_start && !disabled` server `Starting` without connecting.
+    pub fn begin_auto_start(&mut self) -> Result<Vec<String>, RegistryError> {
+        let ids: Vec<String> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|config| config.auto_start && !config.disabled)
+            .map(|config| config.id)
+            .collect();
+        for id in &ids {
+            self.statuses.insert(id.clone(), ServerStatus::Starting);
+        }
+        Ok(ids)
     }
 
     pub async fn stop(&mut self, id: &str) -> Result<(), RegistryError> {
@@ -596,5 +639,192 @@ mod tests {
         let err = registry.update(config).unwrap_err();
         assert!(matches!(err, RegistryError::DuplicateName(_)));
         assert_eq!(registry.list().unwrap()[0].config.name, "everything");
+    }
+
+    struct GatedConnector {
+        gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        tools: Vec<Tool>,
+    }
+
+    #[async_trait]
+    impl BackendConnector for GatedConnector {
+        async fn connect(
+            &self,
+            _config: &ServerConfig,
+            _secrets: &HashMap<String, String>,
+        ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+            let rx = self.gate.lock().unwrap().take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+            Ok(Arc::new(StaticBackend {
+                tools: self.tools.clone(),
+            }))
+        }
+    }
+
+    #[test]
+    fn begin_start_marks_server_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+
+        let config = registry.begin_start("srv-1").unwrap();
+        assert_eq!(config.id, "srv-1");
+        let listed = registry.list().unwrap();
+        assert_eq!(listed[0].status, ServerStatus::Starting);
+        assert!(listed[0].last_error.is_none());
+    }
+
+    #[tokio::test]
+    async fn finish_start_records_backend_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        let config = registry.begin_start("srv-1").unwrap();
+
+        let err = registry
+            .finish_start(
+                &config,
+                Err(RegistryError::Backend("handshake failed".into())),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RegistryError::Backend(_)));
+        let listed = registry.list().unwrap();
+        assert_eq!(listed[0].status, ServerStatus::Error);
+        assert_eq!(
+            listed[0].last_error.as_deref(),
+            Some("backend error: handshake failed")
+        );
+    }
+
+    #[test]
+    fn begin_auto_start_marks_only_flagged_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+
+        let mut auto = local_config("auto", "auto");
+        auto.env_keys.clear();
+        registry.add(auto).unwrap();
+
+        let mut disabled = local_config("disabled", "disabled");
+        disabled.disabled = true;
+        disabled.env_keys.clear();
+        registry.add(disabled).unwrap();
+
+        let mut manual = local_config("manual", "manual");
+        manual.auto_start = false;
+        manual.env_keys.clear();
+        registry.add(manual).unwrap();
+
+        let ids = registry.begin_auto_start().unwrap();
+        assert_eq!(ids, vec!["auto".to_string()]);
+        let by_id: HashMap<_, _> = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.config.id, s.status))
+            .collect();
+        assert_eq!(by_id.get("auto"), Some(&ServerStatus::Starting));
+        assert_eq!(by_id.get("disabled"), Some(&ServerStatus::Stopped));
+        assert_eq!(by_id.get("manual"), Some(&ServerStatus::Stopped));
+    }
+
+    #[tokio::test]
+    async fn list_observes_starting_while_connect_is_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let (release, gate) = tokio::sync::oneshot::channel();
+        let connector = Arc::new(GatedConnector {
+            gate: Mutex::new(Some(gate)),
+            tools: vec![tool("echo")],
+        });
+        let registry = Arc::new(AsyncMutex::new(
+            ServerRegistry::open_sqlite(&path, connector).unwrap(),
+        ));
+        {
+            let mut registry = registry.lock().await;
+            registry.add(local_config("srv-1", "everything")).unwrap();
+        }
+
+        let (config, connector) = {
+            let mut registry = registry.lock().await;
+            let config = registry.begin_start("srv-1").unwrap();
+            (config, registry.connector())
+        };
+        assert_eq!(
+            registry.lock().await.list().unwrap()[0].status,
+            ServerStatus::Starting
+        );
+
+        let connect = tokio::spawn({
+            let config = config.clone();
+            async move { connector.connect(&config, &HashMap::new()).await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            registry.lock().await.list().unwrap()[0].status,
+            ServerStatus::Starting
+        );
+
+        release.send(()).unwrap();
+        let backend = connect.await.unwrap().unwrap();
+        registry
+            .lock()
+            .await
+            .finish_start(&config, Ok(backend))
+            .await
+            .unwrap();
+        assert_eq!(
+            registry.lock().await.list().unwrap()[0].status,
+            ServerStatus::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_finish_start_leaves_sibling_starting() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut first = local_config("first", "first");
+        first.env_keys.clear();
+        registry.add(first).unwrap();
+        let mut second = local_config("second", "second");
+        second.env_keys.clear();
+        registry.add(second).unwrap();
+
+        let ids = registry.begin_auto_start().unwrap();
+        assert_eq!(ids.len(), 2);
+        let first_config = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.config.id == "first")
+            .unwrap()
+            .config;
+        registry
+            .finish_start(
+                &first_config,
+                Err(RegistryError::Backend("handshake failed".into())),
+            )
+            .await
+            .unwrap_err();
+
+        let by_id: HashMap<_, _> = registry
+            .list()
+            .unwrap()
+            .into_iter()
+            .map(|s| (s.config.id, s.status))
+            .collect();
+        assert_eq!(by_id.get("first"), Some(&ServerStatus::Error));
+        assert_eq!(by_id.get("second"), Some(&ServerStatus::Starting));
     }
 }
