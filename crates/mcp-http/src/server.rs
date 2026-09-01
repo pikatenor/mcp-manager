@@ -244,13 +244,20 @@ async fn mcp_handler(
             let ok = outcome.is_ok();
             let error_kind = outcome.as_ref().err().map(error_kind_of);
             let response = match outcome {
-                Ok(value) => jsonrpc_ok(
-                    id,
-                    json!({
-                        "content": [{ "type": "text", "text": value.to_string() }],
-                        "isError": false
-                    }),
-                ),
+                Ok(value) => {
+                    // Upstream CallToolResult objects forward verbatim so
+                    // content blocks and structuredContent survive; plain
+                    // JSON values keep the text-wrapped shape.
+                    let mut result = if value.get("content").and_then(Value::as_array).is_some() {
+                        value
+                    } else {
+                        json!({ "content": [{ "type": "text", "text": value.to_string() }] })
+                    };
+                    if result.get("isError").is_none() {
+                        result["isError"] = json!(false);
+                    }
+                    jsonrpc_ok(id, result)
+                }
                 Err(AggregatorError::UnknownTool(name) | AggregatorError::PrivateTool(name)) => {
                     jsonrpc_err(id, -32601, name)
                 }
@@ -321,6 +328,62 @@ mod tests {
             _arguments: Value,
         ) -> Result<Value, AggregatorError> {
             Err(AggregatorError::Backend("upstream refused".into()))
+        }
+    }
+
+    /// Upstream that returns a full MCP CallToolResult wire object.
+    struct RichBackend;
+
+    fn bare_tool(name: &str) -> Tool {
+        Tool {
+            name: name.into(),
+            title: None,
+            description: None,
+            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
+            output_schema: None,
+            annotations: None,
+            icons: None,
+            meta: None,
+        }
+    }
+
+    #[async_trait]
+    impl McpBackend for RichBackend {
+        async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+            Ok(vec![bare_tool("weather")])
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+        ) -> Result<Value, AggregatorError> {
+            Ok(json!({
+                "content": [
+                    { "type": "text", "text": "{\"temp\":22.5}" },
+                    { "type": "image", "data": "aGk=", "mimeType": "image/png" }
+                ],
+                "structuredContent": { "temp": 22.5 },
+                "isError": false
+            }))
+        }
+    }
+
+    /// Upstream that returns a content array without an `isError` flag.
+    struct BareContentBackend;
+
+    #[async_trait]
+    impl McpBackend for BareContentBackend {
+        async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+            Ok(vec![bare_tool("plain")])
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: Value,
+        ) -> Result<Value, AggregatorError> {
+            Ok(json!({ "content": [{ "type": "text", "text": "plain ok" }] }))
         }
     }
 
@@ -424,16 +487,33 @@ mod tests {
     }
 
     fn app_with_failing_server() -> (Router, String, Arc<CallLog>) {
+        app_with_backend("flaky", Arc::new(FailingBackend))
+    }
+
+    fn app_with_rich_server() -> (Router, String) {
+        let (app, token, _) = app_with_backend("weather", Arc::new(RichBackend));
+        (app, token)
+    }
+
+    fn app_with_bare_content_server() -> (Router, String) {
+        let (app, token, _) = app_with_backend("plain", Arc::new(BareContentBackend));
+        (app, token)
+    }
+
+    fn app_with_backend(
+        name: &str,
+        backend: Arc<dyn McpBackend>,
+    ) -> (Router, String, Arc<CallLog>) {
         let mut tokens = TokenService::new();
         let issued = tokens.issue("cursor");
         let plaintext = issued.plaintext.clone();
         let mut aggregator = Aggregator::new();
         aggregator.add_server(RegisteredServer {
             id: "1".into(),
-            name: "flaky".into(),
+            name: name.into(),
             running: true,
             tool_permissions: Default::default(),
-            backend: Arc::new(FailingBackend),
+            backend,
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
         (
@@ -675,6 +755,33 @@ mod tests {
         assert_eq!(rows[0].error_kind, None);
         assert!(rows[0].duration_ms >= 0);
         assert!(rows[0].called_at > 0);
+    }
+
+    #[tokio::test]
+    async fn tools_call_forwards_upstream_call_tool_result() {
+        let (app, token) = app_with_rich_server();
+        let (_, json) = post_mcp(
+            app,
+            &token,
+            call_body(3, "weather__weather", json!({ "city": "Osaka" })),
+        )
+        .await;
+        let result = &json["result"];
+        assert_eq!(result["content"].as_array().unwrap().len(), 2);
+        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"][1]["mimeType"], "image/png");
+        assert_eq!(result["structuredContent"]["temp"], 22.5);
+        assert_eq!(result["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn tools_call_defaults_is_error_when_upstream_omits() {
+        let (app, token) = app_with_bare_content_server();
+        let (_, json) = post_mcp(app, &token, call_body(3, "plain__plain", json!({}))).await;
+        let result = &json["result"];
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        assert_eq!(result["content"][0]["text"], "plain ok");
+        assert_eq!(result["isError"], false);
     }
 
     #[tokio::test]
