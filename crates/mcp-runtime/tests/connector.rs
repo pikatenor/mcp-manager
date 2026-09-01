@@ -57,6 +57,7 @@ fn handle_mcp(body: Value) -> Response {
                 "type": "text",
                 "text": format!("called {}", body["params"]["name"])
             }],
+            "structuredContent": { "echoed": body["params"]["arguments"] },
             "isError": false
         }),
         _ => {
@@ -283,6 +284,23 @@ async fn sse_remote_lists_tools() {
         .unwrap();
     let tools = backend.list_tools().await.unwrap();
     assert_eq!(tools[0].name, "echo");
+}
+
+#[tokio::test]
+async fn streamable_http_call_result_preserves_structured_content() {
+    let addr = spawn_streamable(None).await;
+    let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
+    let backend = McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+        .unwrap();
+    let result = backend
+        .call_tool("echo", json!({ "q": "hi" }))
+        .await
+        .unwrap();
+    assert_eq!(result["structuredContent"]["echoed"]["q"], "hi");
+    assert_eq!(result["isError"], false);
+    assert_eq!(result["content"][0]["type"], "text");
 }
 
 fn assert_echo_schema(tool: &mcp_core::Tool) {
