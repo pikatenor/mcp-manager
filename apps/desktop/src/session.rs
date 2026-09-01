@@ -5,8 +5,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use mcp_core::{
     is_tool_public, Aggregator, BackendConnector, CallLog, ImportedServer, IssuedToken,
-    ServerConfig, ServerRegistry, ServerState, ServerStatus, ServerType, TokenRecord, TokenService,
-    ToolCallEntry,
+    RegistryError, ServerConfig, ServerRegistry, ServerState, ServerStatus, ServerType,
+    TokenRecord, TokenService, ToolCallEntry,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_client_id_key, server_oauth_client_secret_key,
@@ -615,18 +615,26 @@ impl Session {
     }
 
     pub async fn start_server(&self, id: &str) -> Result<(), String> {
-        let mut registry = self.registry.lock().await;
-        let config = registry
-            .list()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .find(|state| state.config.id == id)
-            .ok_or_else(|| format!("unknown server: {id}"))?
-            .config;
-        let server_secrets =
-            load_secrets(self.secrets.as_ref(), &config).map_err(|e| e.to_string())?;
-        registry
-            .start(id, server_secrets)
+        let (config, server_secrets, connector) = {
+            let mut registry = self.registry.lock().await;
+            let config = registry.begin_start(id).map_err(|e| e.to_string())?;
+            let server_secrets = match load_secrets(self.secrets.as_ref(), &config) {
+                Ok(secrets) => secrets,
+                Err(error) => {
+                    let message = error.to_string();
+                    let _ = registry
+                        .finish_start(&config, Err(RegistryError::Backend(message.clone())))
+                        .await;
+                    return Err(message);
+                }
+            };
+            (config, server_secrets, registry.connector())
+        };
+        let result = connector.connect(&config, &server_secrets).await;
+        self.registry
+            .lock()
+            .await
+            .finish_start(&config, result)
             .await
             .map_err(|e| e.to_string())
     }
@@ -718,24 +726,21 @@ impl Session {
             .is_some())
     }
 
+    pub async fn begin_auto_start(&self) -> Result<Vec<String>, String> {
+        self.registry
+            .lock()
+            .await
+            .begin_auto_start()
+            .map_err(|e| e.to_string())
+    }
+
     pub async fn auto_start(&self) -> Result<(), String> {
-        let mut registry = self.registry.lock().await;
-        let mut all_secrets = HashMap::new();
-        if let Ok(listed) = registry.list() {
-            for state in listed {
-                match load_secrets(self.secrets.as_ref(), &state.config) {
-                    Ok(server_secrets) => {
-                        all_secrets.insert(state.config.id.clone(), server_secrets);
-                    }
-                    Err(error) => {
-                        eprintln!("secret load failed for {}: {error}", state.config.id);
-                    }
-                }
+        let ids = self.begin_auto_start().await?;
+        for id in ids {
+            if let Err(error) = self.start_server(&id).await {
+                eprintln!("auto-start failed for {id}: {error}");
             }
         }
-        registry
-            .auto_start(all_secrets)
-            .await
-            .map_err(|e| e.to_string())
+        Ok(())
     }
 }
