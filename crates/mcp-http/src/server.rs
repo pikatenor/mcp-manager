@@ -417,6 +417,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: Default::default(),
+            cached_tools: None,
             backend: Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
@@ -460,6 +461,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: Default::default(),
+            cached_tools: None,
             backend: Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
@@ -513,6 +515,7 @@ mod tests {
             name: name.into(),
             running: true,
             tool_permissions: Default::default(),
+            cached_tools: None,
             backend,
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
