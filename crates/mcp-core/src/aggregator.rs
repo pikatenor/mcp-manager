@@ -476,4 +476,25 @@ mod tests {
         agg.set_running("1", false);
         changes.recv().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn set_tool_permissions_skips_broadcast_when_unchanged() {
+        let backend = FakeBackend::new(vec![tool("search")]);
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: HashMap::new(),
+            backend,
+        });
+        let mut changes = agg.subscribe_tool_list_changes();
+
+        let permissions = HashMap::from([("search".to_string(), false)]);
+        agg.set_tool_permissions("1", permissions.clone());
+        changes.recv().await.unwrap();
+
+        agg.set_tool_permissions("1", permissions);
+        assert!(changes.try_recv().is_err());
+    }
 }
