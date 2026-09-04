@@ -319,7 +319,9 @@ impl ServerRegistry {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
-        self.aggregator.lock().await.list_tools().await
+        // Snapshot under a short lock; the fan-out runs without it.
+        let servers = self.aggregator.lock().await.listed_servers();
+        Aggregator::resolve_listed_tools(servers).await
     }
 }
 

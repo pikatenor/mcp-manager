@@ -177,9 +177,16 @@ impl Aggregator {
 
     /// Cached tools when present, otherwise a live upstream list.
     async fn server_tools(server: &RegisteredServer) -> Result<Vec<Tool>, AggregatorError> {
-        match &server.cached_tools {
+        Self::cached_or_live(server.cached_tools.as_ref(), &server.backend).await
+    }
+
+    async fn cached_or_live(
+        cached: Option<&Vec<Tool>>,
+        backend: &Arc<dyn McpBackend>,
+    ) -> Result<Vec<Tool>, AggregatorError> {
+        match cached {
             Some(tools) => Ok(tools.clone()),
-            None => server.backend.list_tools().await,
+            None => backend.list_tools().await,
         }
     }
 
@@ -190,13 +197,29 @@ impl Aggregator {
         Self::server_tools(server).await
     }
 
-    pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
+    /// One running server's routing data, cloned out from under the aggregator
+    /// lock so upstream I/O can run without holding it.
+    pub fn listed_servers(&self) -> Vec<ListedServer> {
+        self.servers
+            .iter()
+            .filter(|server| server.running)
+            .map(|server| ListedServer {
+                name: server.name.clone(),
+                tool_permissions: server.tool_permissions.clone(),
+                cached_tools: server.cached_tools.clone(),
+                backend: server.backend.clone(),
+            })
+            .collect()
+    }
+
+    /// Aggregates tool lists for snapshotted servers. The one mapping to
+    /// `AggregatedTool`, so the wire shape cannot drift between callers.
+    pub async fn resolve_listed_tools(
+        servers: Vec<ListedServer>,
+    ) -> Result<Vec<AggregatedTool>, AggregatorError> {
         let mut tools = Vec::new();
-        for server in &self.servers {
-            if !server.running {
-                continue;
-            }
-            for tool in Self::server_tools(server).await? {
+        for server in &servers {
+            for tool in Self::cached_or_live(server.cached_tools.as_ref(), &server.backend).await? {
                 if !crate::permissions::is_tool_public(&server.tool_permissions, &tool.name) {
                     continue;
                 }
@@ -216,7 +239,19 @@ impl Aggregator {
         Ok(tools)
     }
 
+    pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
+        Self::resolve_listed_tools(self.listed_servers()).await
+    }
+
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AggregatorError> {
+        let resolved = self.resolve_tool(name)?;
+        Self::call_resolved(resolved, arguments).await
+    }
+
+    /// Routes a prefixed tool name to its server without any upstream I/O:
+    /// a cached list decides existence immediately, a cache-less server asks
+    /// its backend before the call.
+    pub fn resolve_tool(&self, name: &str) -> Result<ResolvedTool, AggregatorError> {
         let Some((server_name, tool_name)) = crate::naming::strip_server_prefix(name) else {
             return Err(AggregatorError::UnknownTool(name.to_string()));
         };
@@ -230,12 +265,73 @@ impl Aggregator {
         if !crate::permissions::is_tool_public(&server.tool_permissions, tool_name) {
             return Err(AggregatorError::PrivateTool(name.to_string()));
         }
-        let available = Self::server_tools(server).await?;
-        if !available.iter().any(|t| t.name == tool_name) {
-            return Err(AggregatorError::UnknownTool(name.to_string()));
+        let backend = server.backend.clone();
+        let tool_name = tool_name.to_string();
+        match &server.cached_tools {
+            Some(tools) => {
+                if tools.iter().any(|t| t.name == tool_name) {
+                    Ok(ResolvedTool::Ready { backend, tool_name })
+                } else {
+                    Err(AggregatorError::UnknownTool(name.to_string()))
+                }
+            }
+            None => Ok(ResolvedTool::Unverified {
+                backend,
+                tool_name,
+                request: name.to_string(),
+            }),
         }
-        server.backend.call_tool(tool_name, arguments).await
     }
+
+    /// Calls a resolved tool. The `Unverified` path performs the existence
+    /// check itself; callers hold no aggregator lock here.
+    pub async fn call_resolved(
+        resolved: ResolvedTool,
+        arguments: Value,
+    ) -> Result<Value, AggregatorError> {
+        match resolved {
+            ResolvedTool::Ready { backend, tool_name } => {
+                backend.call_tool(&tool_name, arguments).await
+            }
+            ResolvedTool::Unverified {
+                backend,
+                tool_name,
+                request,
+            } => {
+                let available = backend.list_tools().await?;
+                if !available.iter().any(|t| t.name == tool_name) {
+                    return Err(AggregatorError::UnknownTool(request));
+                }
+                backend.call_tool(&tool_name, arguments).await
+            }
+        }
+    }
+}
+
+/// One running server's routing data, cloned out from under the aggregator
+/// lock so upstream I/O can run without holding it.
+pub struct ListedServer {
+    pub name: String,
+    pub tool_permissions: HashMap<String, bool>,
+    pub cached_tools: Option<Vec<Tool>>,
+    pub backend: Arc<dyn McpBackend>,
+}
+
+/// A tool routed by [`Aggregator::resolve_tool`], ready to be invoked with
+/// [`Aggregator::call_resolved`] without holding the aggregator lock.
+pub enum ResolvedTool {
+    /// The cached list confirms the tool exists; call the backend directly.
+    Ready {
+        backend: Arc<dyn McpBackend>,
+        tool_name: String,
+    },
+    /// The server has no cached list; verify existence against the live
+    /// upstream list before calling.
+    Unverified {
+        backend: Arc<dyn McpBackend>,
+        tool_name: String,
+        request: String,
+    },
 }
 
 #[cfg(test)]
