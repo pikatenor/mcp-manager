@@ -700,3 +700,48 @@ async fn connect_refreshes_with_client_authentication_for_confidential_clients()
         Some("at-refresh-1")
     );
 }
+
+fn stdio_config() -> ServerConfig {
+    ServerConfig {
+        id: "local".into(),
+        name: "fixture".into(),
+        server_type: ServerType::Local,
+        command: Some(env!("CARGO_BIN_EXE_stdio_fixture").into()),
+        args: vec![],
+        env_keys: vec![],
+        remote_url: None,
+        auto_start: false,
+        disabled: false,
+        tool_permissions: HashMap::new(),
+    }
+}
+
+#[tokio::test]
+async fn upstream_list_changed_notification_ticks_watcher() {
+    let backend = McpConnector::default()
+        .connect(&stdio_config(), &HashMap::new())
+        .await
+        .unwrap();
+    let mut watcher = backend
+        .tool_list_watcher()
+        .expect("rmcp backend exposes a tool list watcher");
+
+    // The fixture emits `notifications/tools/list_changed` after the
+    // tools/call response.
+    backend.call_tool("echo", json!({})).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(1), watcher.changed())
+        .await
+        .expect("watcher ticked within 1s")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn legacy_backends_have_no_tool_list_watcher() {
+    let addr = spawn_sse().await;
+    let config = remote_config(ServerType::Remote, format!("http://{addr}/sse"));
+    let backend = McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(backend.tool_list_watcher().is_none());
+}

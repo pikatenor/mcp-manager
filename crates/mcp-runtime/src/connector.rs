@@ -47,8 +47,11 @@ impl McpConnector {
     }
 }
 
-/// Presents the aggregator's identity during the MCP handshake.
-struct AggregatorClient;
+/// Presents the aggregator's identity during the MCP handshake and relays
+/// upstream `tools/list_changed` notifications into a watch channel.
+struct AggregatorClient {
+    tool_list_changed: tokio::sync::watch::Sender<u64>,
+}
 
 impl ClientHandler for AggregatorClient {
     fn get_info(&self) -> ClientInfo {
@@ -57,15 +60,28 @@ impl ClientHandler for AggregatorClient {
             Implementation::new("mcp-manager", env!("CARGO_PKG_VERSION")),
         )
     }
+
+    fn on_tool_list_changed(
+        &self,
+        _context: rmcp::service::NotificationContext<RoleClient>,
+    ) -> impl std::future::Future<Output = ()> + rmcp::service::MaybeSendFuture + '_ {
+        self.tool_list_changed.send_modify(|tick| *tick += 1);
+        std::future::ready(())
+    }
 }
 
 /// rmcp-backed backend for stdio and Streamable HTTP upstreams.
 struct RmcpBackend {
     service: RunningService<RoleClient, AggregatorClient>,
+    changes: tokio::sync::watch::Receiver<u64>,
 }
 
 #[async_trait]
 impl McpBackend for RmcpBackend {
+    fn tool_list_watcher(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.clone())
+    }
+
     async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
         let tools = self
             .service
@@ -132,10 +148,11 @@ async fn connect_rmcp_stdio(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|err| RegistryError::Backend(err.to_string()))?;
-    let service = serve_client(AggregatorClient, transport)
+    let (tool_list_changed, changes) = tokio::sync::watch::channel(0);
+    let service = serve_client(AggregatorClient { tool_list_changed }, transport)
         .await
         .map_err(|err| RegistryError::Backend(err.to_string()))?;
-    Ok(RmcpBackend { service })
+    Ok(RmcpBackend { service, changes })
 }
 
 async fn connect_rmcp_http(
@@ -148,14 +165,15 @@ async fn connect_rmcp_http(
     // Refresh-aware OAuth credentials take precedence over a static bearer.
     if let Some(store) = store {
         if let Some(manager) = oauth_manager(url, store.clone(), server_id).await? {
+            let (tool_list_changed, changes) = tokio::sync::watch::channel(0);
             let transport = StreamableHttpClientTransport::with_client(
                 RefreshingHttpClient::new(manager)?,
                 StreamableHttpClientTransportConfig::with_uri(url.to_string()),
             );
-            let service = serve_client(AggregatorClient, transport)
+            let service = serve_client(AggregatorClient { tool_list_changed }, transport)
                 .await
                 .map_err(|err| RegistryError::Backend(err.to_string()))?;
-            return Ok(RmcpBackend { service });
+            return Ok(RmcpBackend { service, changes });
         }
     }
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url.to_string());
@@ -163,11 +181,12 @@ async fn connect_rmcp_http(
         // rmcp applies the Bearer scheme itself via `bearer_auth`.
         transport_config = transport_config.auth_header(token);
     }
+    let (tool_list_changed, changes) = tokio::sync::watch::channel(0);
     let transport = StreamableHttpClientTransport::from_config(transport_config);
-    let service = serve_client(AggregatorClient, transport)
+    let service = serve_client(AggregatorClient { tool_list_changed }, transport)
         .await
         .map_err(|err| RegistryError::Backend(err.to_string()))?;
-    Ok(RmcpBackend { service })
+    Ok(RmcpBackend { service, changes })
 }
 
 /// Build an `AuthorizationManager` over stored OAuth credentials. Returns

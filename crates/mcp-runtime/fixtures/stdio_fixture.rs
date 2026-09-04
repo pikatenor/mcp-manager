@@ -65,5 +65,14 @@ fn main() {
         });
         writeln!(stdout, "{response}").expect("stdout");
         stdout.flush().expect("flush");
+        if method == "tools/call" {
+            // Exercise the client's upstream `tools/list_changed` handling.
+            let notification = json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/tools/list_changed"
+            });
+            writeln!(stdout, "{notification}").expect("stdout");
+            stdout.flush().expect("flush");
+        }
     }
 }

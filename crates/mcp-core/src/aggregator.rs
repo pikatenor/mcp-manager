@@ -77,6 +77,13 @@ pub enum AggregatorError {
 pub trait McpBackend: Send + Sync {
     async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError>;
     async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AggregatorError>;
+
+    /// Receives a tick whenever the upstream pushes
+    /// `notifications/tools/list_changed`, if the transport can deliver push
+    /// notifications. `None` for pull-only backends, which are served live.
+    fn tool_list_watcher(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        None
+    }
 }
 
 pub struct RegisteredServer {
@@ -84,6 +91,9 @@ pub struct RegisteredServer {
     pub name: String,
     pub running: bool,
     pub tool_permissions: HashMap<String, bool>,
+    /// Last known upstream tool list. `None` means serve live: entries start
+    /// unseeded and pull-only backends never enter the cache.
+    pub cached_tools: Option<Vec<Tool>>,
     pub backend: Arc<dyn McpBackend>,
 }
 
@@ -144,11 +154,40 @@ impl Aggregator {
         self.tool_list_changes.subscribe()
     }
 
+    /// Replaces one server's cached tool list and notifies subscribers, but
+    /// only when the list actually changed.
+    pub fn set_cached_tools(&mut self, id: &str, tools: Vec<Tool>) {
+        if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
+            if server.cached_tools.as_ref() == Some(&tools) {
+                return;
+            }
+            server.cached_tools = Some(tools);
+            let _ = self.tool_list_changes.send(());
+        }
+    }
+
+    /// The backend of a running server, cloned out so callers can do upstream
+    /// I/O without holding the aggregator lock.
+    pub fn running_backend(&self, id: &str) -> Option<Arc<dyn McpBackend>> {
+        self.servers
+            .iter()
+            .find(|s| s.id == id && s.running)
+            .map(|s| s.backend.clone())
+    }
+
+    /// Cached tools when present, otherwise a live upstream list.
+    async fn server_tools(server: &RegisteredServer) -> Result<Vec<Tool>, AggregatorError> {
+        match &server.cached_tools {
+            Some(tools) => Ok(tools.clone()),
+            None => server.backend.list_tools().await,
+        }
+    }
+
     pub async fn origin_tools(&self, id: &str) -> Result<Vec<Tool>, AggregatorError> {
         let Some(server) = self.servers.iter().find(|s| s.id == id && s.running) else {
             return Ok(Vec::new());
         };
-        server.backend.list_tools().await
+        Self::server_tools(server).await
     }
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
@@ -157,7 +196,7 @@ impl Aggregator {
             if !server.running {
                 continue;
             }
-            for tool in server.backend.list_tools().await? {
+            for tool in Self::server_tools(server).await? {
                 if !crate::permissions::is_tool_public(&server.tool_permissions, &tool.name) {
                     continue;
                 }
@@ -191,7 +230,7 @@ impl Aggregator {
         if !crate::permissions::is_tool_public(&server.tool_permissions, tool_name) {
             return Err(AggregatorError::PrivateTool(name.to_string()));
         }
-        let available = server.backend.list_tools().await?;
+        let available = Self::server_tools(server).await?;
         if !available.iter().any(|t| t.name == tool_name) {
             return Err(AggregatorError::UnknownTool(name.to_string()));
         }
@@ -261,6 +300,7 @@ mod tests {
             name: "github".into(),
             running: true,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend: github,
         });
         agg.add_server(RegisteredServer {
@@ -268,6 +308,7 @@ mod tests {
             name: "slack".into(),
             running: false,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend: slack,
         });
 
@@ -286,6 +327,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend,
         });
 
@@ -324,6 +366,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend,
         });
 
@@ -350,6 +393,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend,
         });
 
@@ -403,6 +447,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: perms,
+            cached_tools: None,
             backend,
         });
 
@@ -420,6 +465,7 @@ mod tests {
             name: "github".into(),
             running: true,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend: github.clone(),
         });
 
@@ -444,6 +490,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: perms,
+            cached_tools: None,
             backend,
         });
 
@@ -466,6 +513,7 @@ mod tests {
             name: "docs".into(),
             running: false,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend,
         });
         let mut changes = agg.subscribe_tool_list_changes();
@@ -486,6 +534,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: HashMap::new(),
+            cached_tools: None,
             backend,
         });
         let mut changes = agg.subscribe_tool_list_changes();
@@ -496,5 +545,124 @@ mod tests {
 
         agg.set_tool_permissions("1", permissions);
         assert!(changes.try_recv().is_err());
+    }
+
+    /// A backend whose upstream list is unreachable, proving cached reads
+    /// never touch it.
+    struct ErroringListBackend;
+
+    #[async_trait]
+    impl McpBackend for ErroringListBackend {
+        async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+            Err(AggregatorError::Backend("upstream unreachable".into()))
+        }
+
+        async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AggregatorError> {
+            Ok(json!({ "ok": true, "tool": name, "arguments": arguments }))
+        }
+    }
+
+    fn cached_docs_server(backend: Arc<dyn McpBackend>, tools: Vec<Tool>) -> RegisteredServer {
+        RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: HashMap::new(),
+            cached_tools: Some(tools),
+            backend,
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_tools_serve_list_without_backend_io() {
+        let mut agg = Aggregator::new();
+        agg.add_server(cached_docs_server(
+            Arc::new(ErroringListBackend),
+            vec![tool("echo")],
+        ));
+
+        let names: Vec<_> = agg
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["docs__echo"]);
+    }
+
+    #[tokio::test]
+    async fn cached_tools_preserve_tool_metadata() {
+        let mut agg = Aggregator::new();
+        agg.add_server(cached_docs_server(
+            Arc::new(ErroringListBackend),
+            vec![metadata_tool("fetch")],
+        ));
+
+        let tools = agg.list_tools().await.unwrap();
+        assert_eq!(tools[0].title.as_deref(), Some("Fetch Page"));
+        assert_eq!(
+            tools[0].output_schema.as_ref().unwrap()["required"][0],
+            "html"
+        );
+        assert_eq!(tools[0].annotations.as_ref().unwrap()["readOnlyHint"], true);
+        assert_eq!(
+            tools[0].icons.as_ref().unwrap()[0]["src"],
+            "https://example.com/i.png"
+        );
+        assert_eq!(tools[0].meta.as_ref().unwrap()["upstream"], "tag");
+    }
+
+    #[tokio::test]
+    async fn set_cached_tools_broadcasts_on_change_only() {
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: HashMap::new(),
+            cached_tools: None,
+            backend: Arc::new(ErroringListBackend),
+        });
+        let mut changes = agg.subscribe_tool_list_changes();
+
+        agg.set_cached_tools("1", vec![tool("echo")]);
+        assert!(changes.try_recv().is_ok());
+
+        agg.set_cached_tools("1", vec![tool("echo")]);
+        assert!(changes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn call_tool_checks_existence_against_cache() {
+        let mut agg = Aggregator::new();
+        agg.add_server(cached_docs_server(
+            Arc::new(ErroringListBackend),
+            vec![tool("search")],
+        ));
+
+        let result = agg.call_tool("docs__search", json!({})).await.unwrap();
+        assert_eq!(result["ok"], true);
+
+        let err = agg.call_tool("docs__missing", json!({})).await.unwrap_err();
+        assert!(matches!(err, AggregatorError::UnknownTool(_)));
+    }
+
+    #[tokio::test]
+    async fn origin_tools_serves_cache_without_backend_io() {
+        let mut agg = Aggregator::new();
+        agg.add_server(cached_docs_server(
+            Arc::new(ErroringListBackend),
+            vec![tool("echo")],
+        ));
+
+        let names: Vec<_> = agg
+            .origin_tools("1")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["echo"]);
     }
 }
