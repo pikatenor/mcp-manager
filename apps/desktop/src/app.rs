@@ -157,6 +157,20 @@ pub(crate) fn add_request_from_form(input: FormInput<'_>) -> AddServerRequest {
     }
 }
 
+/// Flips one tool's public flag in the local snapshot, returning the previous
+/// value so a failed persist can roll the flip back. `None` means the server
+/// or tool is not in the local snapshot.
+pub(crate) fn apply_tool_toggle(
+    tools_by_server: &mut HashMap<String, Vec<ServerToolView>>,
+    id: &str,
+    tool_name: &str,
+    public: bool,
+) -> Option<bool> {
+    let tools = tools_by_server.get_mut(id)?;
+    let tool = tools.iter_mut().find(|tool| tool.name == tool_name)?;
+    Some(std::mem::replace(&mut tool.public, public))
+}
+
 /// Prefilled form values for one server, produced by the EditServer task.
 #[derive(Debug, Clone)]
 pub(crate) struct EditFormState {
@@ -245,6 +259,48 @@ mod tests {
         assert_eq!(request.oauth_client_id, None);
         assert_eq!(request.oauth_client_secret, None);
     }
+
+    fn tool_view(name: &str, public: bool) -> ServerToolView {
+        ServerToolView {
+            name: name.to_string(),
+            public,
+        }
+    }
+
+    #[test]
+    fn apply_tool_toggle_flips_matching_tool_and_returns_previous() {
+        let mut tools = HashMap::from([(
+            "srv-1".to_string(),
+            vec![tool_view("echo", true), tool_view("delete", false)],
+        )]);
+
+        let previous = apply_tool_toggle(&mut tools, "srv-1", "echo", false);
+
+        assert_eq!(previous, Some(true));
+        let rows = &tools["srv-1"];
+        assert!(!rows.iter().find(|t| t.name == "echo").unwrap().public);
+        assert!(!rows.iter().find(|t| t.name == "delete").unwrap().public);
+    }
+
+    #[test]
+    fn apply_tool_toggle_ignores_unknown_server() {
+        let mut tools = HashMap::from([("srv-1".to_string(), vec![tool_view("echo", true)])]);
+
+        let previous = apply_tool_toggle(&mut tools, "srv-x", "echo", false);
+
+        assert_eq!(previous, None);
+        assert!(tools["srv-1"][0].public);
+    }
+
+    #[test]
+    fn apply_tool_toggle_ignores_unknown_tool() {
+        let mut tools = HashMap::from([("srv-1".to_string(), vec![tool_view("echo", true)])]);
+
+        let previous = apply_tool_toggle(&mut tools, "srv-1", "ghost", true);
+
+        assert_eq!(previous, None);
+        assert!(tools["srv-1"][0].public);
+    }
 }
 
 pub(crate) struct App {
@@ -329,6 +385,12 @@ pub enum Message {
         id: String,
         name: String,
         public: bool,
+    },
+    ToggleToolDone {
+        id: String,
+        name: String,
+        previous: bool,
+        result: Result<(), String>,
     },
     ToggleToolList(String),
     Oauth(String),
@@ -921,12 +983,46 @@ impl App {
                 )
             }
             Message::ToggleTool { id, name, public } => {
+                // Optimistic: flip locally first — a full snapshot would wait on
+                // a live tools/list from every running server for one bool.
+                let Some(previous) =
+                    apply_tool_toggle(&mut self.tools_by_server, &id, &name, public)
+                else {
+                    return Task::none();
+                };
                 let session = self.session.clone();
+                let persist_id = id.clone();
+                let persist_name = name.clone();
                 Task::perform(
-                    async move { session.set_tool_permission(&id, &name, public).await },
-                    Message::OpDone,
+                    async move {
+                        session
+                            .set_tool_permission(&persist_id, &persist_name, public)
+                            .await
+                    },
+                    move |result| Message::ToggleToolDone {
+                        id,
+                        name,
+                        previous,
+                        result,
+                    },
                 )
             }
+            Message::ToggleToolDone {
+                id,
+                name,
+                previous,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.error = None;
+                    Task::none()
+                }
+                Err(error) => {
+                    apply_tool_toggle(&mut self.tools_by_server, &id, &name, previous);
+                    self.error = Some(error);
+                    Task::none()
+                }
+            },
             Message::ToggleToolList(id) => {
                 if self.tools_expanded.take(&id).is_none() {
                     self.tools_expanded.insert(id);
