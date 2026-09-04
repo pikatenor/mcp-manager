@@ -119,13 +119,18 @@ impl ServerRegistry {
         Ok(self.store.add(config)?)
     }
 
-    pub fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
+    /// Persists `config` and pushes permission changes into the running
+    /// aggregator. Awaited (not `try_lock`) so a change is never silently
+    /// dropped while an inbound request holds the aggregator; safe because
+    /// lock ordering is always registry → aggregator.
+    pub async fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
         self.ensure_unique_name(&config.name, Some(&config.id))?;
         let updated = self.store.update(config)?;
-        if let Ok(mut aggregator) = self.aggregator.try_lock() {
-            aggregator.set_tool_permissions(&updated.id, updated.tool_permissions.clone());
-        }
+        self.aggregator
+            .lock()
+            .await
+            .set_tool_permissions(&updated.id, updated.tool_permissions.clone());
         Ok(updated)
     }
 
@@ -572,7 +577,7 @@ mod tests {
 
         let mut config = registry.list().unwrap()[0].config.clone();
         config.tool_permissions.insert("delete".into(), false);
-        registry.update(config).unwrap();
+        registry.update(config).await.unwrap();
         let names: Vec<_> = registry
             .list_tools()
             .await
@@ -581,6 +586,57 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["everything__echo"]);
+    }
+
+    #[tokio::test]
+    async fn update_applies_permissions_and_notifies_while_aggregator_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let registry = Arc::new(AsyncMutex::new(
+            ServerRegistry::open_sqlite(
+                &path,
+                RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]),
+            )
+            .unwrap(),
+        ));
+        let aggregator = registry.lock().await.aggregator();
+        // Subscribe before start so the start broadcast can be drained below.
+        let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
+        {
+            let mut registry = registry.lock().await;
+            registry.add(local_config("srv-1", "everything")).unwrap();
+            registry.start("srv-1", HashMap::new()).await.unwrap();
+        }
+        // Drain the start broadcast so the only pending signal would be the
+        // permission change itself.
+        changes.recv().await.unwrap();
+
+        // Hold the aggregator the way an in-flight inbound tools/list does;
+        // the update must wait for it, not silently skip.
+        let held = aggregator.lock().await;
+        let update = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                let mut config = registry.lock().await.list().unwrap()[0].config.clone();
+                config.tool_permissions.insert("delete".into(), false);
+                registry.lock().await.update(config).await.unwrap();
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(held);
+        update.await.unwrap();
+
+        let names: Vec<_> = registry
+            .lock()
+            .await
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["everything__echo"]);
+        assert!(changes.try_recv().is_ok());
     }
 
     #[test]
@@ -619,20 +675,20 @@ mod tests {
         assert!(matches!(err, RegistryError::InvalidConfig(_)));
     }
 
-    #[test]
-    fn update_allows_keeping_own_name() {
+    #[tokio::test]
+    async fn update_allows_keeping_own_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let mut registry =
             ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
         registry.add(local_config("srv-1", "everything")).unwrap();
         let config = registry.list().unwrap()[0].config.clone();
-        registry.update(config).unwrap();
+        registry.update(config).await.unwrap();
         assert_eq!(registry.list().unwrap()[0].config.name, "everything");
     }
 
-    #[test]
-    fn update_rejects_rename_onto_existing_name() {
+    #[tokio::test]
+    async fn update_rejects_rename_onto_existing_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let mut registry =
@@ -641,7 +697,7 @@ mod tests {
         registry.add(local_config("srv-2", "other")).unwrap();
         let mut config = registry.list().unwrap()[0].config.clone();
         config.name = "other".into();
-        let err = registry.update(config).unwrap_err();
+        let err = registry.update(config).await.unwrap_err();
         assert!(matches!(err, RegistryError::DuplicateName(_)));
         assert_eq!(registry.list().unwrap()[0].config.name, "everything");
     }
