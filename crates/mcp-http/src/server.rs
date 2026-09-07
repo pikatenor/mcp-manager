@@ -207,8 +207,10 @@ async fn mcp_handler(
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
         "ping" => jsonrpc_ok(id, json!({})),
         "tools/list" => {
-            let aggregator = state.aggregator.lock().await;
-            match aggregator.list_tools().await {
+            // Snapshot routing data under a short lock; the upstream fan-out
+            // runs without it so one slow upstream cannot stall the server.
+            let servers = state.aggregator.lock().await.listed_servers();
+            match Aggregator::resolve_listed_tools(servers).await {
                 Ok(tools) => {
                     // AggregatedTool serializes as exactly an MCP Tool wire
                     // object, so upstream metadata forwards verbatim.
@@ -234,10 +236,15 @@ async fn mcp_handler(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let started = Instant::now();
-            // Scoped block: drop the aggregator guard before the blocking log write.
+            // Scoped block: routing resolves under a short lock and the
+            // upstream call runs without the aggregator, which also keeps the
+            // guard away from the blocking log write below.
             let outcome = {
-                let aggregator = state.aggregator.lock().await;
-                aggregator.call_tool(name, arguments).await
+                let resolved = state.aggregator.lock().await.resolve_tool(name);
+                match resolved {
+                    Ok(resolved) => Aggregator::call_resolved(resolved, arguments).await,
+                    Err(err) => Err(err),
+                }
             };
             let duration_ms = started.elapsed().as_millis() as i64;
             let (server, tool) = strip_server_prefix(name).unwrap_or(("", name));
@@ -288,6 +295,7 @@ mod tests {
         Aggregator, AggregatorError, CallLog, McpBackend, RegisteredServer, TokenService, Tool,
     };
     use serde_json::{json, Value};
+    use std::collections::HashMap;
     use tower::ServiceExt;
 
     struct FakeBackend {
@@ -417,6 +425,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: Default::default(),
+            cached_tools: None,
             backend: Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
@@ -460,6 +469,7 @@ mod tests {
             name: "docs".into(),
             running: true,
             tool_permissions: Default::default(),
+            cached_tools: None,
             backend: Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
@@ -513,6 +523,7 @@ mod tests {
             name: name.into(),
             running: true,
             tool_permissions: Default::default(),
+            cached_tools: None,
             backend,
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
@@ -823,5 +834,132 @@ mod tests {
         assert_eq!(rows[0].tool, "nodelimiter");
         assert!(!rows[0].ok);
         assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
+    }
+
+    /// Upstream backend whose list blocks until released, with a signal for
+    /// when the handler has reached it.
+    struct GatedBackend {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: AsyncMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    impl GatedBackend {
+        async fn wait_release(&self) {
+            if let Some(rx) = self.release.lock().await.take() {
+                let _ = rx.await;
+            }
+        }
+    }
+
+    #[async_trait]
+    impl McpBackend for GatedBackend {
+        async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+            let _ = self.entered.send(());
+            self.wait_release().await;
+            Ok(vec![bare_tool("search")])
+        }
+
+        async fn call_tool(&self, name: &str, _arguments: Value) -> Result<Value, AggregatorError> {
+            Ok(json!({ "content": [], "isError": false, "tool": name }))
+        }
+    }
+
+    /// Like `app_with_docs_server_and_change_handle`, but the upstream list
+    /// hangs until `release` fires, and `entered` reports when it started.
+    fn app_with_gated_backend() -> (
+        Router,
+        String,
+        Arc<AsyncMutex<Aggregator>>,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let mut tokens = TokenService::new();
+        let issued = tokens.issue("cursor");
+        let plaintext = issued.plaintext.clone();
+        let (entered_tx, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut aggregator = Aggregator::new();
+        aggregator.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: true,
+            tool_permissions: Default::default(),
+            cached_tools: None,
+            backend: Arc::new(GatedBackend {
+                entered: entered_tx,
+                release: AsyncMutex::new(Some(release_rx)),
+            }),
+        });
+        let aggregator = Arc::new(AsyncMutex::new(aggregator));
+        let app = router_with_aggregator(
+            Arc::new(Mutex::new(tokens)),
+            aggregator.clone(),
+            Arc::new(CallLog::memory().unwrap()),
+        );
+        (app, plaintext, aggregator, entered_rx, release_tx)
+    }
+
+    async fn hide_search(aggregator: &AsyncMutex<Aggregator>) {
+        aggregator
+            .lock()
+            .await
+            .set_tool_permissions("1", HashMap::from([("search".to_string(), false)]));
+    }
+
+    #[tokio::test]
+    async fn tools_list_does_not_block_permission_updates() {
+        let (app, token, aggregator, mut entered, release) = app_with_gated_backend();
+        let task = tokio::spawn(async move {
+            post_mcp(
+                app,
+                &token,
+                json!({ "jsonrpc": "2.0", "id": 7, "method": "tools/list", "params": {} }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // While the upstream list is gated, a permission change must not wait
+        // on the aggregator being held by the request.
+        tokio::time::timeout(std::time::Duration::from_secs(1), hide_search(&aggregator))
+            .await
+            .expect("permission update not blocked by in-flight tools/list");
+
+        release.send(()).unwrap();
+        let (status, _) = task.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn tools_call_does_not_block_permission_updates() {
+        let (app, token, aggregator, mut entered, release) = app_with_gated_backend();
+        let task = tokio::spawn(async move {
+            post_mcp(
+                app,
+                &token,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": 8,
+                    "method": "tools/call",
+                    "params": { "name": "docs__search", "arguments": {} }
+                }),
+            )
+            .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), hide_search(&aggregator))
+            .await
+            .expect("permission update not blocked by in-flight tools/call");
+
+        release.send(()).unwrap();
+        let (status, _) = task.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
     }
 }

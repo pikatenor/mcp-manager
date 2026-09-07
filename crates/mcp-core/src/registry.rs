@@ -99,6 +99,18 @@ fn validate_startable(config: &ServerConfig) -> Result<(), RegistryError> {
     Ok(())
 }
 
+/// Re-fetches one server's tool list into the cache. Never holds the
+/// aggregator across the upstream call, and never touches the registry lock.
+async fn refresh_cached_tools(aggregator: &Arc<AsyncMutex<Aggregator>>, id: &str) {
+    let Some(backend) = aggregator.lock().await.running_backend(id) else {
+        return;
+    };
+    // On failure keep the last known list; the next tick retries.
+    if let Ok(tools) = backend.list_tools().await {
+        aggregator.lock().await.set_cached_tools(id, tools);
+    }
+}
+
 impl ServerRegistry {
     pub fn open_sqlite(
         path: &Path,
@@ -119,13 +131,18 @@ impl ServerRegistry {
         Ok(self.store.add(config)?)
     }
 
-    pub fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
+    /// Persists `config` and pushes permission changes into the running
+    /// aggregator. Awaited (not `try_lock`) so a change is never silently
+    /// dropped while an inbound request holds the aggregator; safe because
+    /// lock ordering is always registry → aggregator.
+    pub async fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
         self.ensure_unique_name(&config.name, Some(&config.id))?;
         let updated = self.store.update(config)?;
-        if let Ok(mut aggregator) = self.aggregator.try_lock() {
-            aggregator.set_tool_permissions(&updated.id, updated.tool_permissions.clone());
-        }
+        self.aggregator
+            .lock()
+            .await
+            .set_tool_permissions(&updated.id, updated.tool_permissions.clone());
         Ok(updated)
     }
 
@@ -214,8 +231,23 @@ impl ServerRegistry {
                         name: config.name.clone(),
                         running: true,
                         tool_permissions: config.tool_permissions.clone(),
-                        backend,
+                        cached_tools: None,
+                        backend: backend.clone(),
                     });
+                // Spawned so start latency stays at connect cost; until the
+                // first fetch lands the aggregator serves live lists.
+                if let Some(mut watcher) = backend.tool_list_watcher() {
+                    let aggregator = self.aggregator.clone();
+                    let id = config.id.clone();
+                    tokio::spawn(async move {
+                        refresh_cached_tools(&aggregator, &id).await;
+                        // The backend dropping on restart or stop ends this
+                        // loop via a closed watch channel.
+                        while watcher.changed().await.is_ok() {
+                            refresh_cached_tools(&aggregator, &id).await;
+                        }
+                    });
+                }
                 self.statuses
                     .insert(config.id.clone(), ServerStatus::Running);
                 self.errors.remove(&config.id);
@@ -287,7 +319,9 @@ impl ServerRegistry {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
-        self.aggregator.lock().await.list_tools().await
+        // Snapshot under a short lock; the fan-out runs without it.
+        let servers = self.aggregator.lock().await.listed_servers();
+        Aggregator::resolve_listed_tools(servers).await
     }
 }
 
@@ -315,6 +349,65 @@ mod tests {
             _arguments: serde_json::Value,
         ) -> Result<serde_json::Value, AggregatorError> {
             Ok(serde_json::json!({ "ok": true }))
+        }
+    }
+
+    /// Backend whose tool list mutates at runtime and that can signal a
+    /// refresh, mimicking an upstream pushing `tools/list_changed`.
+    struct MutableBackend {
+        tools: Mutex<Vec<Tool>>,
+        changes: tokio::sync::watch::Sender<u64>,
+    }
+
+    impl MutableBackend {
+        fn new(tools: Vec<Tool>) -> Arc<Self> {
+            let (changes, _) = tokio::sync::watch::channel(0);
+            Arc::new(Self {
+                tools: Mutex::new(tools),
+                changes,
+            })
+        }
+
+        fn set_tools(&self, tools: Vec<Tool>) {
+            *self.tools.lock().unwrap() = tools;
+        }
+
+        /// Emulates what rmcp's notification handler does on a real
+        /// `tools/list_changed` push.
+        fn tick(&self) {
+            self.changes.send_modify(|tick| *tick += 1);
+        }
+    }
+
+    #[async_trait]
+    impl McpBackend for MutableBackend {
+        async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+            Ok(self.tools.lock().unwrap().clone())
+        }
+
+        async fn call_tool(
+            &self,
+            _name: &str,
+            _arguments: serde_json::Value,
+        ) -> Result<serde_json::Value, AggregatorError> {
+            Ok(serde_json::json!({ "ok": true }))
+        }
+
+        fn tool_list_watcher(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+            Some(self.changes.subscribe())
+        }
+    }
+
+    struct MutableConnector(Arc<MutableBackend>);
+
+    #[async_trait]
+    impl BackendConnector for MutableConnector {
+        async fn connect(
+            &self,
+            _config: &ServerConfig,
+            _secrets: &HashMap<String, String>,
+        ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+            Ok(self.0.clone())
         }
     }
 
@@ -484,6 +577,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_cache_serves_upstream_snapshot_until_refreshed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        let mut registry =
+            ServerRegistry::open_sqlite(&path, Arc::new(MutableConnector(backend.clone())))
+                .unwrap();
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        let aggregator = registry.aggregator();
+        let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
+
+        registry.start("srv-1", HashMap::new()).await.unwrap();
+        // First broadcast is the start's upsert, the second is the
+        // refresher's initial fetch landing in the cache.
+        changes.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+
+        backend.set_tools(vec![tool("echo"), tool("delete")]);
+        // Until the upstream signals a change, the snapshot stays served.
+        let names: Vec<_> = registry
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["everything__echo"]);
+
+        backend.tick();
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let names: Vec<_> = registry
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["everything__echo", "everything__delete"]);
+    }
+
+    #[tokio::test]
     async fn auto_start_skips_disabled_and_manual_servers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
@@ -572,7 +712,7 @@ mod tests {
 
         let mut config = registry.list().unwrap()[0].config.clone();
         config.tool_permissions.insert("delete".into(), false);
-        registry.update(config).unwrap();
+        registry.update(config).await.unwrap();
         let names: Vec<_> = registry
             .list_tools()
             .await
@@ -581,6 +721,57 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["everything__echo"]);
+    }
+
+    #[tokio::test]
+    async fn update_applies_permissions_and_notifies_while_aggregator_lock_is_held() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.db");
+        let registry = Arc::new(AsyncMutex::new(
+            ServerRegistry::open_sqlite(
+                &path,
+                RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]),
+            )
+            .unwrap(),
+        ));
+        let aggregator = registry.lock().await.aggregator();
+        // Subscribe before start so the start broadcast can be drained below.
+        let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
+        {
+            let mut registry = registry.lock().await;
+            registry.add(local_config("srv-1", "everything")).unwrap();
+            registry.start("srv-1", HashMap::new()).await.unwrap();
+        }
+        // Drain the start broadcast so the only pending signal would be the
+        // permission change itself.
+        changes.recv().await.unwrap();
+
+        // Hold the aggregator the way an in-flight inbound tools/list does;
+        // the update must wait for it, not silently skip.
+        let held = aggregator.lock().await;
+        let update = tokio::spawn({
+            let registry = registry.clone();
+            async move {
+                let mut config = registry.lock().await.list().unwrap()[0].config.clone();
+                config.tool_permissions.insert("delete".into(), false);
+                registry.lock().await.update(config).await.unwrap();
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        drop(held);
+        update.await.unwrap();
+
+        let names: Vec<_> = registry
+            .lock()
+            .await
+            .list_tools()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|t| t.name)
+            .collect();
+        assert_eq!(names, vec!["everything__echo"]);
+        assert!(changes.try_recv().is_ok());
     }
 
     #[test]
@@ -619,20 +810,20 @@ mod tests {
         assert!(matches!(err, RegistryError::InvalidConfig(_)));
     }
 
-    #[test]
-    fn update_allows_keeping_own_name() {
+    #[tokio::test]
+    async fn update_allows_keeping_own_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let mut registry =
             ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
         registry.add(local_config("srv-1", "everything")).unwrap();
         let config = registry.list().unwrap()[0].config.clone();
-        registry.update(config).unwrap();
+        registry.update(config).await.unwrap();
         assert_eq!(registry.list().unwrap()[0].config.name, "everything");
     }
 
-    #[test]
-    fn update_rejects_rename_onto_existing_name() {
+    #[tokio::test]
+    async fn update_rejects_rename_onto_existing_name() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("state.db");
         let mut registry =
@@ -641,7 +832,7 @@ mod tests {
         registry.add(local_config("srv-2", "other")).unwrap();
         let mut config = registry.list().unwrap()[0].config.clone();
         config.name = "other".into();
-        let err = registry.update(config).unwrap_err();
+        let err = registry.update(config).await.unwrap_err();
         assert!(matches!(err, RegistryError::DuplicateName(_)));
         assert_eq!(registry.list().unwrap()[0].config.name, "everything");
     }

@@ -500,7 +500,7 @@ impl Session {
             updated.env_keys = request.env.keys().cloned().collect();
             updated.remote_url = request.remote_url.filter(|u| !u.trim().is_empty());
             updated.auto_start = request.auto_start;
-            registry.update(updated).map_err(|e| e.to_string())?;
+            registry.update(updated).await.map_err(|e| e.to_string())?;
             (state.config, was_running)
         };
         let old_client_id = self
@@ -690,7 +690,7 @@ impl Session {
         config
             .tool_permissions
             .insert(tool_name.to_string(), public);
-        registry.update(config).map_err(|e| e.to_string())?;
+        registry.update(config).await.map_err(|e| e.to_string())?;
         Ok(())
     }
 
