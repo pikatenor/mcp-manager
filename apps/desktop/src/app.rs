@@ -157,9 +157,6 @@ pub(crate) fn add_request_from_form(input: FormInput<'_>) -> AddServerRequest {
     }
 }
 
-/// Flips one tool's public flag in the local snapshot, returning the previous
-/// value so a failed persist can roll the flip back. `None` means the server
-/// or tool is not in the local snapshot.
 pub(crate) fn apply_tool_toggle(
     tools_by_server: &mut HashMap<String, Vec<ServerToolView>>,
     id: &str,

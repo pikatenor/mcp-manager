@@ -47,8 +47,7 @@ impl McpConnector {
     }
 }
 
-/// Presents the aggregator's identity during the MCP handshake and relays
-/// upstream `tools/list_changed` notifications into a watch channel.
+/// Presents the aggregator's identity during the MCP handshake.
 struct AggregatorClient {
     tool_list_changed: tokio::sync::watch::Sender<u64>,
 }

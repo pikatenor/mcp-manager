@@ -99,8 +99,7 @@ fn validate_startable(config: &ServerConfig) -> Result<(), RegistryError> {
     Ok(())
 }
 
-/// Re-fetches one server's tool list into the cache. Never holds the
-/// aggregator across the upstream call, and never touches the registry lock.
+/// Re-fetches one server's tool list into the cache.
 async fn refresh_cached_tools(aggregator: &Arc<AsyncMutex<Aggregator>>, id: &str) {
     let Some(backend) = aggregator.lock().await.running_backend(id) else {
         return;
