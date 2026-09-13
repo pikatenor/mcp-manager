@@ -166,8 +166,6 @@ impl Aggregator {
         }
     }
 
-    /// The backend of a running server, cloned out so callers can do upstream
-    /// I/O without holding the aggregator lock.
     pub fn running_backend(&self, id: &str) -> Option<Arc<dyn McpBackend>> {
         self.servers
             .iter()
@@ -175,7 +173,6 @@ impl Aggregator {
             .map(|s| s.backend.clone())
     }
 
-    /// Cached tools when present, otherwise a live upstream list.
     async fn server_tools(server: &RegisteredServer) -> Result<Vec<Tool>, AggregatorError> {
         Self::cached_or_live(server.cached_tools.as_ref(), &server.backend).await
     }
@@ -197,8 +194,6 @@ impl Aggregator {
         Self::server_tools(server).await
     }
 
-    /// One running server's routing data, cloned out from under the aggregator
-    /// lock so upstream I/O can run without holding it.
     pub fn listed_servers(&self) -> Vec<ListedServer> {
         self.servers
             .iter()
@@ -212,8 +207,6 @@ impl Aggregator {
             .collect()
     }
 
-    /// Aggregates tool lists for snapshotted servers. The one mapping to
-    /// `AggregatedTool`, so the wire shape cannot drift between callers.
     pub async fn resolve_listed_tools(
         servers: Vec<ListedServer>,
     ) -> Result<Vec<AggregatedTool>, AggregatorError> {
@@ -283,8 +276,6 @@ impl Aggregator {
         }
     }
 
-    /// Calls a resolved tool. The `Unverified` path performs the existence
-    /// check itself; callers hold no aggregator lock here.
     pub async fn call_resolved(
         resolved: ResolvedTool,
         arguments: Value,
@@ -317,8 +308,6 @@ pub struct ListedServer {
     pub backend: Arc<dyn McpBackend>,
 }
 
-/// A tool routed by [`Aggregator::resolve_tool`], ready to be invoked with
-/// [`Aggregator::call_resolved`] without holding the aggregator lock.
 pub enum ResolvedTool {
     /// The cached list confirms the tool exists; call the backend directly.
     Ready {

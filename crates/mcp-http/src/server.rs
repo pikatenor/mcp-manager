@@ -207,13 +207,10 @@ async fn mcp_handler(
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
         "ping" => jsonrpc_ok(id, json!({})),
         "tools/list" => {
-            // Snapshot routing data under a short lock; the upstream fan-out
-            // runs without it so one slow upstream cannot stall the server.
+            // Snapshot routing data under a short lock;
             let servers = state.aggregator.lock().await.listed_servers();
             match Aggregator::resolve_listed_tools(servers).await {
                 Ok(tools) => {
-                    // AggregatedTool serializes as exactly an MCP Tool wire
-                    // object, so upstream metadata forwards verbatim.
                     let tools: Vec<Value> = tools
                         .into_iter()
                         .map(|tool| {
@@ -236,9 +233,6 @@ async fn mcp_handler(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let started = Instant::now();
-            // Scoped block: routing resolves under a short lock and the
-            // upstream call runs without the aggregator, which also keeps the
-            // guard away from the blocking log write below.
             let outcome = {
                 let resolved = state.aggregator.lock().await.resolve_tool(name);
                 match resolved {
