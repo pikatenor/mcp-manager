@@ -148,12 +148,15 @@ impl Aggregator {
 
     /// Insert a stopped entry seeded from persisted state. Insert-only: a
     /// live entry for the same id is never clobbered, and seeding itself is
-    /// silent — callers batch one `notify_tools_changed` at the end.
-    pub fn seed_stopped(&mut self, server: RegisteredServer) {
+    /// silent — callers batch one `notify_tools_changed` at the end. Returns
+    /// whether an entry was actually inserted, so repeated restores stay
+    /// silent.
+    pub fn seed_stopped(&mut self, server: RegisteredServer) -> bool {
         if self.servers.iter().any(|s| s.id == server.id) {
-            return;
+            return false;
         }
         self.servers.push(server);
+        true
     }
 
     /// Drop one server's entry entirely (running or seeded) and notify.

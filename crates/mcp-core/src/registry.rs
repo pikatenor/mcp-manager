@@ -11,6 +11,7 @@ use super::aggregator::{
 use super::remote_url::validate_remote_url;
 use super::servers::{ServerConfig, ServerStore, ServerType};
 use super::store::StoreError;
+use super::tool_cache::ToolCacheStore;
 use tokio::sync::Mutex as AsyncMutex;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -61,6 +62,7 @@ pub struct ServerRegistry {
     aggregator: Arc<AsyncMutex<Aggregator>>,
     statuses: HashMap<String, ServerStatus>,
     errors: HashMap<String, String>,
+    tool_cache: Arc<ToolCacheStore>,
 }
 
 fn validate_config(config: &ServerConfig) -> Result<(), RegistryError> {
@@ -99,13 +101,22 @@ fn validate_startable(config: &ServerConfig) -> Result<(), RegistryError> {
     Ok(())
 }
 
-/// Re-fetches one server's tool list into the cache.
-async fn refresh_cached_tools(aggregator: &Arc<AsyncMutex<Aggregator>>, id: &str) {
+/// Re-fetches one server's tool list into the cache and persists it, so the
+/// row survives a restart and can seed the stopped entry.
+async fn refresh_cached_tools(
+    aggregator: &Arc<AsyncMutex<Aggregator>>,
+    tool_cache: &ToolCacheStore,
+    id: &str,
+) {
     let Some(backend) = aggregator.lock().await.running_backend(id) else {
         return;
     };
     // On failure keep the last known list; the next tick retries.
     if let Ok(tools) = backend.list_tools().await {
+        // Best-effort: a failed persist still updates the in-memory cache.
+        if let Err(err) = tool_cache.set(id, &tools) {
+            eprintln!("persist tool cache for {id} failed: {err}");
+        }
         aggregator.lock().await.set_cached_tools(id, tools);
     }
 }
@@ -114,6 +125,7 @@ impl ServerRegistry {
     pub fn open_sqlite(
         path: &Path,
         connector: Arc<dyn BackendConnector>,
+        tool_cache: Arc<ToolCacheStore>,
     ) -> Result<Self, RegistryError> {
         Ok(Self {
             store: ServerStore::open_sqlite(path)?,
@@ -121,6 +133,7 @@ impl ServerRegistry {
             aggregator: Arc::new(AsyncMutex::new(Aggregator::new())),
             statuses: HashMap::new(),
             errors: HashMap::new(),
+            tool_cache,
         })
     }
 
@@ -130,18 +143,35 @@ impl ServerRegistry {
         Ok(self.store.add(config)?)
     }
 
-    /// Persists `config` and pushes permission changes into the running
-    /// aggregator. Awaited (not `try_lock`) so a change is never silently
-    /// dropped while an inbound request holds the aggregator; safe because
-    /// lock ordering is always registry → aggregator.
+    /// Persists `config` and pushes changes into the aggregator. Awaited
+    /// (not `try_lock`) so a change is never silently dropped while an
+    /// inbound request holds the aggregator; safe because lock ordering is
+    /// always registry → aggregator. A running server keeps today's path
+    /// (permissions only); a stopped one has its seeded entry rebuilt so
+    /// renames and the disabled flag take effect.
     pub async fn update(&mut self, config: ServerConfig) -> Result<ServerConfig, RegistryError> {
         validate_config(&config)?;
         self.ensure_unique_name(&config.name, Some(&config.id))?;
         let updated = self.store.update(config)?;
-        self.aggregator
-            .lock()
-            .await
-            .set_tool_permissions(&updated.id, updated.tool_permissions.clone());
+        let running = self.statuses.get(&updated.id).copied() == Some(ServerStatus::Running);
+        let mut aggregator = self.aggregator.lock().await;
+        if running {
+            aggregator.set_tool_permissions(&updated.id, updated.tool_permissions.clone());
+        } else {
+            aggregator.remove_server(&updated.id);
+            if !updated.disabled {
+                if let Some(tools) = self.tool_cache.get(&updated.id)? {
+                    aggregator.seed_stopped(RegisteredServer {
+                        id: updated.id.clone(),
+                        name: updated.name.clone(),
+                        running: false,
+                        tool_permissions: updated.tool_permissions.clone(),
+                        cached_tools: Some(tools),
+                        backend: None,
+                    });
+                }
+            }
+        }
         Ok(updated)
     }
 
@@ -167,6 +197,10 @@ impl ServerRegistry {
             return Ok(false);
         }
         let _ = self.stop(id).await;
+        // Without these a deleted server's persisted cache would resurface
+        // as a seeded entry on the next launch.
+        self.tool_cache.delete(id)?;
+        self.aggregator.lock().await.remove_server(id);
         Ok(self.store.delete(id)?)
     }
 
@@ -237,13 +271,14 @@ impl ServerRegistry {
                 // first fetch lands the aggregator serves live lists.
                 if let Some(mut watcher) = backend.tool_list_watcher() {
                     let aggregator = self.aggregator.clone();
+                    let tool_cache = self.tool_cache.clone();
                     let id = config.id.clone();
                     tokio::spawn(async move {
-                        refresh_cached_tools(&aggregator, &id).await;
+                        refresh_cached_tools(&aggregator, &tool_cache, &id).await;
                         // The backend dropping on restart or stop ends this
                         // loop via a closed watch channel.
                         while watcher.changed().await.is_ok() {
-                            refresh_cached_tools(&aggregator, &id).await;
+                            refresh_cached_tools(&aggregator, &tool_cache, &id).await;
                         }
                     });
                 }
@@ -296,6 +331,46 @@ impl ServerRegistry {
         self.statuses
             .insert(config.id.clone(), ServerStatus::Stopped);
         self.errors.remove(&config.id);
+        Ok(())
+    }
+
+    /// Seed every persisted non-disabled server that has a cached tool list
+    /// as a stopped aggregator entry, so the inbound endpoint can serve
+    /// cached tools (when enabled) and route on-demand starts. Runs at every
+    /// launch, before auto-start; never clobbers live entries, so it is also
+    /// safe to re-run.
+    pub async fn restore_stopped_servers(&mut self) -> Result<(), RegistryError> {
+        let configs: Vec<ServerConfig> = self
+            .store
+            .list()?
+            .into_iter()
+            .filter(|config| !config.disabled)
+            .collect();
+        // Cache rows are read before the aggregator lock so the lock is held
+        // only for in-memory inserts (lock ordering: registry → aggregator).
+        let mut entries = Vec::new();
+        for config in &configs {
+            if let Some(tools) = self.tool_cache.get(&config.id)? {
+                entries.push(RegisteredServer {
+                    id: config.id.clone(),
+                    name: config.name.clone(),
+                    running: false,
+                    tool_permissions: config.tool_permissions.clone(),
+                    cached_tools: Some(tools),
+                    backend: None,
+                });
+            }
+        }
+        let mut aggregator = self.aggregator.lock().await;
+        let mut inserted = 0;
+        for entry in entries {
+            if aggregator.seed_stopped(entry) {
+                inserted += 1;
+            }
+        }
+        if inserted > 0 {
+            aggregator.notify_tools_changed();
+        }
         Ok(())
     }
 
@@ -469,16 +544,56 @@ mod tests {
         }
     }
 
+    fn open_registry(
+        dir: &tempfile::TempDir,
+        connector: Arc<dyn BackendConnector>,
+    ) -> ServerRegistry {
+        ServerRegistry::open_sqlite(
+            &dir.path().join("state.db"),
+            connector,
+            Arc::new(ToolCacheStore::open_sqlite(&dir.path().join("tool-cache.db")).unwrap()),
+        )
+        .unwrap()
+    }
+
+    /// Tool names as the inbound endpoint would list them, including stopped
+    /// servers' cached entries when `include_stopped` is set.
+    async fn listed_tool_names(registry: &ServerRegistry, include_stopped: bool) -> Vec<String> {
+        let servers = registry
+            .aggregator()
+            .lock()
+            .await
+            .listed_servers(include_stopped);
+        Aggregator::resolve_listed_tools(servers)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
+    }
+
+    /// Start `id` and drain the start-upsert and initial-cache broadcasts so
+    /// later assertions on the change channel see only new signals.
+    async fn start_and_settle(registry: &mut ServerRegistry, id: &str) {
+        let aggregator = registry.aggregator();
+        let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
+        registry.start(id, HashMap::new()).await.unwrap();
+        changes.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     #[test]
     fn persisted_servers_load_as_stopped() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
         let connector = RecordingConnector::with_tools(vec![]);
         {
-            let mut registry = ServerRegistry::open_sqlite(&path, connector.clone()).unwrap();
+            let mut registry = open_registry(&dir, connector.clone());
             registry.add(local_config("srv-1", "everything")).unwrap();
         }
-        let registry = ServerRegistry::open_sqlite(&path, connector).unwrap();
+        let registry = open_registry(&dir, connector);
         let listed = registry.list().unwrap();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].config.name, "everything");
@@ -489,9 +604,7 @@ mod tests {
     #[test]
     fn add_rejects_plain_http_remote() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         let err = registry
             .add(ServerConfig {
                 id: "bad".into(),
@@ -515,9 +628,8 @@ mod tests {
     #[tokio::test]
     async fn start_injects_secrets_and_exposes_public_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
         let connector = RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]);
-        let mut registry = ServerRegistry::open_sqlite(&path, connector.clone()).unwrap();
+        let mut registry = open_registry(&dir, connector.clone());
         let mut config = local_config("srv-1", "everything");
         config.tool_permissions.insert("delete".into(), false);
         registry.add(config).unwrap();
@@ -546,10 +658,7 @@ mod tests {
     #[tokio::test]
     async fn stop_hides_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
-                .unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![tool("echo")]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         registry.stop("srv-1").await.unwrap();
@@ -560,10 +669,7 @@ mod tests {
     #[tokio::test]
     async fn start_and_stop_notify_tool_list_subscribers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
-                .unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![tool("echo")]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         let aggregator = registry.aggregator();
         let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
@@ -578,11 +684,8 @@ mod tests {
     #[tokio::test]
     async fn tool_cache_serves_upstream_snapshot_until_refreshed() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
         let backend = MutableBackend::new(vec![tool("echo")]);
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, Arc::new(MutableConnector(backend.clone())))
-                .unwrap();
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
         registry.add(local_config("srv-1", "everything")).unwrap();
         let aggregator = registry.aggregator();
         let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
@@ -625,9 +728,8 @@ mod tests {
     #[tokio::test]
     async fn auto_start_skips_disabled_and_manual_servers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
         let connector = RecordingConnector::with_tools(vec![tool("echo")]);
-        let mut registry = ServerRegistry::open_sqlite(&path, connector.clone()).unwrap();
+        let mut registry = open_registry(&dir, connector.clone());
 
         let mut auto = local_config("auto", "auto");
         auto.env_keys.clear();
@@ -659,10 +761,7 @@ mod tests {
     #[tokio::test]
     async fn shared_aggregator_handle_lists_started_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
-                .unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![tool("echo")]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         let tools = registry
@@ -678,10 +777,7 @@ mod tests {
     #[tokio::test]
     async fn delete_stops_and_removes() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![tool("echo")]))
-                .unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![tool("echo")]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         assert!(registry.delete("srv-1").await.unwrap());
@@ -692,12 +788,10 @@ mod tests {
     #[tokio::test]
     async fn update_permissions_hides_running_tools() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry = ServerRegistry::open_sqlite(
-            &path,
+        let mut registry = open_registry(
+            &dir,
             RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]),
-        )
-        .unwrap();
+        );
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.start("srv-1", HashMap::new()).await.unwrap();
         let names: Vec<_> = registry
@@ -725,14 +819,10 @@ mod tests {
     #[tokio::test]
     async fn update_applies_permissions_and_notifies_while_aggregator_lock_is_held() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let registry = Arc::new(AsyncMutex::new(
-            ServerRegistry::open_sqlite(
-                &path,
-                RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]),
-            )
-            .unwrap(),
-        ));
+        let registry = Arc::new(AsyncMutex::new(open_registry(
+            &dir,
+            RecordingConnector::with_tools(vec![tool("echo"), tool("delete")]),
+        )));
         let aggregator = registry.lock().await.aggregator();
         // Subscribe before start so the start broadcast can be drained below.
         let mut changes = aggregator.lock().await.subscribe_tool_list_changes();
@@ -776,9 +866,7 @@ mod tests {
     #[test]
     fn add_rejects_duplicate_name() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         let err = registry
             .add(local_config("srv-2", "everything"))
@@ -790,19 +878,137 @@ mod tests {
     #[test]
     fn add_rejects_blank_name() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         let err = registry.add(local_config("srv-1", "  ")).unwrap_err();
         assert!(matches!(err, RegistryError::InvalidConfig(_)));
+    }
+
+    #[tokio::test]
+    async fn restore_seeds_stopped_tools_from_persisted_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        {
+            let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
+            registry.add(local_config("srv-1", "everything")).unwrap();
+            start_and_settle(&mut registry, "srv-1").await;
+        }
+        // Simulated app restart: fresh registry over the same databases.
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend)));
+        registry.restore_stopped_servers().await.unwrap();
+        assert_eq!(
+            listed_tool_names(&registry, true).await,
+            vec!["everything__echo".to_string()]
+        );
+        // Flag-off behavior is unchanged: stopped servers stay hidden.
+        assert!(listed_tool_names(&registry, false).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_skips_disabled_servers() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        {
+            let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
+            let mut config = local_config("srv-1", "everything");
+            config.disabled = true;
+            registry.add(config).unwrap();
+            start_and_settle(&mut registry, "srv-1").await;
+        }
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend)));
+        registry.restore_stopped_servers().await.unwrap();
+        assert!(listed_tool_names(&registry, true).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_without_cache_row_lists_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![tool("echo")]));
+        registry.add(local_config("srv-1", "everything")).unwrap();
+
+        registry.restore_stopped_servers().await.unwrap();
+        assert!(listed_tool_names(&registry, true).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn restore_notifies_once_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        {
+            let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
+            registry.add(local_config("srv-1", "everything")).unwrap();
+            start_and_settle(&mut registry, "srv-1").await;
+        }
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend)));
+        let mut changes = registry
+            .aggregator()
+            .lock()
+            .await
+            .subscribe_tool_list_changes();
+
+        registry.restore_stopped_servers().await.unwrap();
+        assert!(changes.try_recv().is_ok());
+
+        // Re-running the restore (entries already present) stays silent.
+        registry.restore_stopped_servers().await.unwrap();
+        assert!(changes.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_removes_cache_row_and_aggregator_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        start_and_settle(&mut registry, "srv-1").await;
+        registry.stop("srv-1").await.unwrap();
+
+        assert!(registry.delete("srv-1").await.unwrap());
+        assert!(listed_tool_names(&registry, true).await.is_empty());
+        let reopened = ToolCacheStore::open_sqlite(&dir.path().join("tool-cache.db")).unwrap();
+        assert!(reopened.get("srv-1").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn update_rebuilds_stopped_entry_name_and_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        start_and_settle(&mut registry, "srv-1").await;
+        registry.stop("srv-1").await.unwrap();
+
+        let mut config = registry.list().unwrap()[0].config.clone();
+        config.name = "renamed".into();
+        registry.update(config).await.unwrap();
+        assert_eq!(
+            listed_tool_names(&registry, true).await,
+            vec!["renamed__echo".to_string()]
+        );
+
+        let mut config = registry.list().unwrap()[0].config.clone();
+        config.disabled = true;
+        registry.update(config).await.unwrap();
+        assert!(listed_tool_names(&registry, true).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_persists_cache_to_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let backend = MutableBackend::new(vec![tool("echo")]);
+        let mut registry = open_registry(&dir, Arc::new(MutableConnector(backend.clone())));
+        registry.add(local_config("srv-1", "everything")).unwrap();
+        start_and_settle(&mut registry, "srv-1").await;
+
+        let reopened = ToolCacheStore::open_sqlite(&dir.path().join("tool-cache.db")).unwrap();
+        let tools = reopened.get("srv-1").unwrap().unwrap();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].name, "echo");
     }
 
     #[test]
     fn add_rejects_delimiter_name() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         let err = registry
             .add(local_config("srv-1", "bad__name"))
             .unwrap_err();
@@ -812,9 +1018,7 @@ mod tests {
     #[tokio::test]
     async fn update_allows_keeping_own_name() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         let config = registry.list().unwrap()[0].config.clone();
         registry.update(config).await.unwrap();
@@ -824,9 +1028,7 @@ mod tests {
     #[tokio::test]
     async fn update_rejects_rename_onto_existing_name() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         registry.add(local_config("srv-2", "other")).unwrap();
         let mut config = registry.list().unwrap()[0].config.clone();
@@ -861,9 +1063,7 @@ mod tests {
     #[test]
     fn begin_start_marks_server_starting() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         registry.add(local_config("srv-1", "everything")).unwrap();
 
         let config = registry.begin_start("srv-1").unwrap();
@@ -876,9 +1076,7 @@ mod tests {
     #[tokio::test]
     async fn finish_start_records_backend_error() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         registry.add(local_config("srv-1", "everything")).unwrap();
         let config = registry.begin_start("srv-1").unwrap();
 
@@ -901,9 +1099,7 @@ mod tests {
     #[test]
     fn begin_auto_start_marks_only_flagged_servers() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
 
         let mut auto = local_config("auto", "auto");
         auto.env_keys.clear();
@@ -935,15 +1131,12 @@ mod tests {
     #[tokio::test]
     async fn list_observes_starting_while_connect_is_in_flight() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
         let (release, gate) = tokio::sync::oneshot::channel();
         let connector = Arc::new(GatedConnector {
             gate: Mutex::new(Some(gate)),
             tools: vec![tool("echo")],
         });
-        let registry = Arc::new(AsyncMutex::new(
-            ServerRegistry::open_sqlite(&path, connector).unwrap(),
-        ));
+        let registry = Arc::new(AsyncMutex::new(open_registry(&dir, connector)));
         {
             let mut registry = registry.lock().await;
             registry.add(local_config("srv-1", "everything")).unwrap();
@@ -986,9 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn failed_finish_start_leaves_sibling_starting() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("state.db");
-        let mut registry =
-            ServerRegistry::open_sqlite(&path, RecordingConnector::with_tools(vec![])).unwrap();
+        let mut registry = open_registry(&dir, RecordingConnector::with_tools(vec![]));
         let mut first = local_config("first", "first");
         first.env_keys.clear();
         registry.add(first).unwrap();

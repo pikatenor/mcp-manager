@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mcp_core::{
     is_tool_public, Aggregator, BackendConnector, CallLog, ImportedServer, IssuedToken,
     RegistryError, ServerConfig, ServerRegistry, ServerState, ServerStatus, ServerType,
-    TokenRecord, TokenService, ToolCallEntry,
+    TokenRecord, TokenService, ToolCacheStore, ToolCallEntry,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_client_id_key, server_oauth_client_secret_key,
@@ -252,8 +252,14 @@ impl Session {
         std::fs::create_dir_all(data_dir).map_err(|e| e.to_string())?;
         let tokens =
             TokenService::open_sqlite(&data_dir.join("tokens.db")).map_err(|e| e.to_string())?;
-        let registry = ServerRegistry::open_sqlite(&data_dir.join("state.db"), connector)
+        let tool_cache = ToolCacheStore::open_sqlite(&data_dir.join("tool-cache.db"))
             .map_err(|e| e.to_string())?;
+        let registry = ServerRegistry::open_sqlite(
+            &data_dir.join("state.db"),
+            connector,
+            Arc::new(tool_cache),
+        )
+        .map_err(|e| e.to_string())?;
         let aggregator = registry.aggregator();
         let call_log =
             CallLog::open_sqlite(&data_dir.join("calls.db")).map_err(|e| e.to_string())?;

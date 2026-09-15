@@ -10,6 +10,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use super::aggregator::Tool;
 use super::store::{db_err, json_from_sql, json_to_sql, StoreError};
 
+/// Cloneable so spawned watcher tasks can keep persisting refreshes.
+#[derive(Clone)]
 pub struct ToolCacheStore {
     conn: Arc<Mutex<Connection>>,
 }
