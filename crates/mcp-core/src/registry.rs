@@ -231,7 +231,7 @@ impl ServerRegistry {
                         running: true,
                         tool_permissions: config.tool_permissions.clone(),
                         cached_tools: None,
-                        backend: backend.clone(),
+                        backend: Some(backend.clone()),
                     });
                 // Spawned so start latency stays at connect cost; until the
                 // first fetch lands the aggregator serves live lists.
@@ -319,7 +319,7 @@ impl ServerRegistry {
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
         // Snapshot under a short lock; the fan-out runs without it.
-        let servers = self.aggregator.lock().await.listed_servers();
+        let servers = self.aggregator.lock().await.listed_servers(false);
         Aggregator::resolve_listed_tools(servers).await
     }
 }

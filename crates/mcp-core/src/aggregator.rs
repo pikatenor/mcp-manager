@@ -69,6 +69,10 @@ pub enum AggregatorError {
     UnknownTool(String),
     #[error("tool is private: {0}")]
     PrivateTool(String),
+    /// The routing table knows the server but it is not running; carries the
+    /// server name so the caller can start it and retry.
+    #[error("server not running: {0}")]
+    ServerNotRunning(String),
     #[error("backend error: {0}")]
     Backend(String),
 }
@@ -94,7 +98,9 @@ pub struct RegisteredServer {
     /// Last known upstream tool list. `None` means serve live: entries start
     /// unseeded and pull-only backends never enter the cache.
     pub cached_tools: Option<Vec<Tool>>,
-    pub backend: Arc<dyn McpBackend>,
+    /// `None` for entries seeded from persisted state that have not connected
+    /// this session; such entries are only ever served from the cache.
+    pub backend: Option<Arc<dyn McpBackend>>,
 }
 
 pub struct Aggregator {
@@ -140,6 +146,29 @@ impl Aggregator {
         }
     }
 
+    /// Insert a stopped entry seeded from persisted state. Insert-only: a
+    /// live entry for the same id is never clobbered, and seeding itself is
+    /// silent — callers batch one `notify_tools_changed` at the end.
+    pub fn seed_stopped(&mut self, server: RegisteredServer) {
+        if self.servers.iter().any(|s| s.id == server.id) {
+            return;
+        }
+        self.servers.push(server);
+    }
+
+    /// Drop one server's entry entirely (running or seeded) and notify.
+    pub fn remove_server(&mut self, id: &str) {
+        if let Some(index) = self.servers.iter().position(|s| s.id == id) {
+            self.servers.remove(index);
+            let _ = self.tool_list_changes.send(());
+        }
+    }
+
+    /// One change notification for a batch of updates.
+    pub fn notify_tools_changed(&self) {
+        let _ = self.tool_list_changes.send(());
+    }
+
     pub fn set_tool_permissions(&mut self, id: &str, tool_permissions: HashMap<String, bool>) {
         if let Some(server) = self.servers.iter_mut().find(|s| s.id == id) {
             if server.tool_permissions == tool_permissions {
@@ -170,7 +199,7 @@ impl Aggregator {
         self.servers
             .iter()
             .find(|s| s.id == id && s.running)
-            .map(|s| s.backend.clone())
+            .and_then(|s| s.backend.clone())
     }
 
     async fn server_tools(server: &RegisteredServer) -> Result<Vec<Tool>, AggregatorError> {
@@ -179,11 +208,13 @@ impl Aggregator {
 
     async fn cached_or_live(
         cached: Option<&Vec<Tool>>,
-        backend: &Arc<dyn McpBackend>,
+        backend: &Option<Arc<dyn McpBackend>>,
     ) -> Result<Vec<Tool>, AggregatorError> {
-        match cached {
-            Some(tools) => Ok(tools.clone()),
-            None => backend.list_tools().await,
+        match (cached, backend) {
+            (Some(tools), _) => Ok(tools.clone()),
+            (None, Some(backend)) => backend.list_tools().await,
+            // A seeded entry without a backend has nothing to serve live.
+            (None, None) => Ok(Vec::new()),
         }
     }
 
@@ -194,10 +225,16 @@ impl Aggregator {
         Self::server_tools(server).await
     }
 
-    pub fn listed_servers(&self) -> Vec<ListedServer> {
+    /// Routing snapshot of the servers to list. With
+    /// `include_stopped_cached`, stopped entries that carry a cached tool
+    /// list are included too; they are served from the cache only, so the
+    /// snapshot never performs I/O on their behalf.
+    pub fn listed_servers(&self, include_stopped_cached: bool) -> Vec<ListedServer> {
         self.servers
             .iter()
-            .filter(|server| server.running)
+            .filter(|server| {
+                server.running || (include_stopped_cached && server.cached_tools.is_some())
+            })
             .map(|server| ListedServer {
                 name: server.name.clone(),
                 tool_permissions: server.tool_permissions.clone(),
@@ -233,7 +270,7 @@ impl Aggregator {
     }
 
     pub async fn list_tools(&self) -> Result<Vec<AggregatedTool>, AggregatorError> {
-        Self::resolve_listed_tools(self.listed_servers()).await
+        Self::resolve_listed_tools(self.listed_servers(false)).await
     }
 
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<Value, AggregatorError> {
@@ -243,22 +280,27 @@ impl Aggregator {
 
     /// Routes a prefixed tool name to its server without any upstream I/O:
     /// a cached list decides existence immediately, a cache-less server asks
-    /// its backend before the call.
+    /// its backend before the call. The server is matched by name even when
+    /// stopped, so callers can tell "known but not running" (and optionally
+    /// start it) apart from a missing tool.
     pub fn resolve_tool(&self, name: &str) -> Result<ResolvedTool, AggregatorError> {
         let Some((server_name, tool_name)) = crate::naming::strip_server_prefix(name) else {
             return Err(AggregatorError::UnknownTool(name.to_string()));
         };
-        let Some(server) = self
-            .servers
-            .iter()
-            .find(|s| s.running && s.name == server_name)
-        else {
+        let Some(server) = self.servers.iter().find(|s| s.name == server_name) else {
             return Err(AggregatorError::UnknownTool(name.to_string()));
         };
+        // Permission before running state: a private tool must never leak
+        // its existence or trigger a start.
         if !crate::permissions::is_tool_public(&server.tool_permissions, tool_name) {
             return Err(AggregatorError::PrivateTool(name.to_string()));
         }
-        let backend = server.backend.clone();
+        if !server.running {
+            return Err(AggregatorError::ServerNotRunning(server.name.clone()));
+        }
+        let Some(backend) = server.backend.clone() else {
+            return Err(AggregatorError::ServerNotRunning(server.name.clone()));
+        };
         let tool_name = tool_name.to_string();
         match &server.cached_tools {
             Some(tools) => {
@@ -299,13 +341,13 @@ impl Aggregator {
     }
 }
 
-/// One running server's routing data, cloned out from under the aggregator
+/// One listed server's routing data, cloned out from under the aggregator
 /// lock so upstream I/O can run without holding it.
 pub struct ListedServer {
     pub name: String,
     pub tool_permissions: HashMap<String, bool>,
     pub cached_tools: Option<Vec<Tool>>,
-    pub backend: Arc<dyn McpBackend>,
+    pub backend: Option<Arc<dyn McpBackend>>,
 }
 
 pub enum ResolvedTool {
@@ -386,7 +428,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend: github,
+            backend: Some(github),
         });
         agg.add_server(RegisteredServer {
             id: "2".into(),
@@ -394,7 +436,7 @@ mod tests {
             running: false,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend: slack,
+            backend: Some(slack),
         });
 
         let tools = agg.list_tools().await.unwrap();
@@ -413,7 +455,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
 
         let tools = agg.list_tools().await.unwrap();
@@ -452,7 +494,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
 
         let tools = agg.list_tools().await.unwrap();
@@ -479,7 +521,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
 
         let tools = agg.list_tools().await.unwrap();
@@ -533,7 +575,7 @@ mod tests {
             running: true,
             tool_permissions: perms,
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
 
         let tools = agg.list_tools().await.unwrap();
@@ -551,7 +593,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend: github.clone(),
+            backend: Some(github.clone()),
         });
 
         let result = agg
@@ -576,7 +618,7 @@ mod tests {
             running: true,
             tool_permissions: perms,
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
 
         assert_eq!(
@@ -599,7 +641,7 @@ mod tests {
             running: false,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
         let mut changes = agg.subscribe_tool_list_changes();
 
@@ -620,7 +662,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
         let mut changes = agg.subscribe_tool_list_changes();
 
@@ -654,7 +696,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: Some(tools),
-            backend,
+            backend: Some(backend),
         }
     }
 
@@ -707,7 +749,7 @@ mod tests {
             running: true,
             tool_permissions: HashMap::new(),
             cached_tools: None,
-            backend: Arc::new(ErroringListBackend),
+            backend: Some(Arc::new(ErroringListBackend)),
         });
         let mut changes = agg.subscribe_tool_list_changes();
 
@@ -749,5 +791,139 @@ mod tests {
             .map(|t| t.name)
             .collect();
         assert_eq!(names, vec!["echo"]);
+    }
+
+    /// A stopped entry as it would be seeded from persisted state: no
+    /// backend, cached list present.
+    fn seeded_docs_server(tools: Vec<Tool>) -> RegisteredServer {
+        RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: false,
+            tool_permissions: HashMap::new(),
+            cached_tools: Some(tools),
+            backend: None,
+        }
+    }
+
+    /// `resolve_tool`'s Ok type is not Debug, so unwrap_err is unavailable.
+    fn resolve_err(agg: &Aggregator, name: &str) -> AggregatorError {
+        match agg.resolve_tool(name) {
+            Ok(_) => panic!("expected resolve error for {name}"),
+            Err(err) => err,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tools_includes_stopped_cache_when_requested_and_hides_when_not() {
+        let mut agg = Aggregator::new();
+        agg.add_server(seeded_docs_server(vec![tool("echo")]));
+
+        let names = |tools: Vec<AggregatedTool>| -> Vec<String> {
+            tools.into_iter().map(|t| t.name).collect()
+        };
+        let listed = names(
+            Aggregator::resolve_listed_tools(agg.listed_servers(true))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(listed, vec!["docs__echo"]);
+        let hidden = names(
+            Aggregator::resolve_listed_tools(agg.listed_servers(false))
+                .await
+                .unwrap(),
+        );
+        assert!(hidden.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_tools_excludes_stopped_servers_without_cache() {
+        let mut agg = Aggregator::new();
+        agg.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: false,
+            tool_permissions: HashMap::new(),
+            cached_tools: None,
+            backend: None,
+        });
+
+        let listed = Aggregator::resolve_listed_tools(agg.listed_servers(true))
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+    }
+
+    #[test]
+    fn resolve_tool_reports_server_not_running_for_stopped_entry() {
+        let mut agg = Aggregator::new();
+        agg.add_server(seeded_docs_server(vec![tool("echo")]));
+
+        assert!(matches!(
+            resolve_err(&agg, "docs__echo"),
+            AggregatorError::ServerNotRunning(server) if server == "docs"
+        ));
+    }
+
+    #[test]
+    fn resolve_tool_keeps_private_tools_private_when_stopped() {
+        let mut server = seeded_docs_server(vec![tool("search")]);
+        server.tool_permissions.insert("search".into(), false);
+        let mut agg = Aggregator::new();
+        agg.add_server(server);
+
+        assert!(matches!(
+            resolve_err(&agg, "docs__search"),
+            AggregatorError::PrivateTool(name) if name == "docs__search"
+        ));
+    }
+
+    #[test]
+    fn resolve_tool_unknown_when_server_absent() {
+        let mut agg = Aggregator::new();
+        agg.add_server(seeded_docs_server(vec![tool("echo")]));
+
+        assert!(matches!(
+            resolve_err(&agg, "ghost__echo"),
+            AggregatorError::UnknownTool(name) if name == "ghost__echo"
+        ));
+    }
+
+    #[tokio::test]
+    async fn seed_stopped_inserts_once_and_stays_silent() {
+        let mut agg = Aggregator::new();
+        let mut changes = agg.subscribe_tool_list_changes();
+
+        agg.seed_stopped(seeded_docs_server(vec![tool("echo")]));
+        // Seeding a second entry for the same id must not clobber the first
+        // (a live entry must always win) and must stay silent either way.
+        let mut live = seeded_docs_server(vec![tool("echo"), tool("delete")]);
+        live.running = true;
+        agg.seed_stopped(live);
+        assert!(changes.try_recv().is_err());
+
+        let listed = Aggregator::resolve_listed_tools(agg.listed_servers(true))
+            .await
+            .unwrap();
+        let names: Vec<_> = listed.into_iter().map(|t| t.name).collect();
+        assert_eq!(names, vec!["docs__echo"]);
+    }
+
+    #[tokio::test]
+    async fn remove_server_hides_cached_tools_and_notifies() {
+        let mut agg = Aggregator::new();
+        agg.add_server(seeded_docs_server(vec![tool("echo")]));
+        let mut changes = agg.subscribe_tool_list_changes();
+
+        agg.remove_server("1");
+        assert!(changes.try_recv().is_ok());
+
+        let listed = Aggregator::resolve_listed_tools(agg.listed_servers(true))
+            .await
+            .unwrap();
+        assert!(listed.is_empty());
+        // Removing an absent id neither panics nor notifies.
+        agg.remove_server("ghost");
+        assert!(changes.try_recv().is_err());
     }
 }

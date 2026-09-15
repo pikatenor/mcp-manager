@@ -157,6 +157,8 @@ fn error_kind_of(err: &AggregatorError) -> &'static str {
     match err {
         AggregatorError::UnknownTool(_) => "unknown_tool",
         AggregatorError::PrivateTool(_) => "private_tool",
+        // Flag-off parity: a stopped server's tool is reported unknown.
+        AggregatorError::ServerNotRunning(_) => "unknown_tool",
         AggregatorError::Backend(_) => "backend_error",
     }
 }
@@ -208,7 +210,7 @@ async fn mcp_handler(
         "ping" => jsonrpc_ok(id, json!({})),
         "tools/list" => {
             // Snapshot routing data under a short lock;
-            let servers = state.aggregator.lock().await.listed_servers();
+            let servers = state.aggregator.lock().await.listed_servers(false);
             match Aggregator::resolve_listed_tools(servers).await {
                 Ok(tools) => {
                     let tools: Vec<Value> = tools
@@ -261,6 +263,11 @@ async fn mcp_handler(
                 }
                 Err(AggregatorError::UnknownTool(name) | AggregatorError::PrivateTool(name)) => {
                     jsonrpc_err(id, -32601, name)
+                }
+                // Without an on-demand start a stopped server's tool is
+                // indistinguishable from an unknown tool on the wire.
+                Err(AggregatorError::ServerNotRunning(_)) => {
+                    jsonrpc_err(id, -32601, name.to_string())
                 }
                 Err(err) => jsonrpc_ok(
                     id,
@@ -420,7 +427,7 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend: Arc::new(FakeBackend {
+            backend: Some(Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
                     title: Some("Docs Search".into()),
@@ -439,7 +446,7 @@ mod tests {
                     icons: Some(json!([{ "src": "https://example.com/search.png" }])),
                     meta: Some(json!({ "fixture": "docs" })),
                 }],
-            }),
+            })),
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
         (
@@ -464,7 +471,7 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend: Arc::new(FakeBackend {
+            backend: Some(Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
                     title: None,
@@ -479,7 +486,7 @@ mod tests {
                     icons: None,
                     meta: None,
                 }],
-            }),
+            })),
         });
         let aggregator = Arc::new(AsyncMutex::new(aggregator));
         let app = router_with_aggregator(
@@ -518,7 +525,7 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
         (
@@ -879,10 +886,10 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend: Arc::new(GatedBackend {
+            backend: Some(Arc::new(GatedBackend {
                 entered: entered_tx,
                 release: AsyncMutex::new(Some(release_rx)),
-            }),
+            })),
         });
         let aggregator = Arc::new(AsyncMutex::new(aggregator));
         let app = router_with_aggregator(
