@@ -12,6 +12,7 @@ pub mod permissions;
 pub mod registry;
 pub mod remote_url;
 pub mod servers;
+pub mod settings;
 pub mod sse;
 pub mod store;
 pub mod token;
@@ -28,6 +29,7 @@ pub use permissions::is_tool_public;
 pub use registry::{BackendConnector, RegistryError, ServerRegistry, ServerState, ServerStatus};
 pub use remote_url::{validate_remote_url, RemoteUrlError};
 pub use servers::{ServerConfig, ServerStore, ServerType};
+pub use settings::{read_settings, AppSettings, SettingsStore, SharedSettings};
 pub use sse::{
     parse_sse_endpoint_event, parse_sse_message_events, SseClientTransport, SseTransportError,
 };
