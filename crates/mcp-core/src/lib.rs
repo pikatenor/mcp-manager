@@ -16,6 +16,7 @@ pub mod settings;
 pub mod sse;
 pub mod store;
 pub mod token;
+pub mod tool_cache;
 
 pub use aggregator::{
     empty_input_schema, AggregatedTool, Aggregator, AggregatorError, McpBackend, RegisteredServer,
@@ -35,6 +36,7 @@ pub use sse::{
 };
 pub use store::StoreError;
 pub use token::{IssuedToken, TokenError, TokenRecord, TokenService};
+pub use tool_cache::ToolCacheStore;
 
 /// Default bind address for the aggregator HTTP endpoint.
 pub const DEFAULT_HTTP_BIND: &str = "127.0.0.1:8757";
