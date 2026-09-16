@@ -27,7 +27,9 @@ pub use mcp_json::{parse_mcp_servers, ImportedServer, ParsedImport};
 pub use migrations::{run_pending, Migration, MigrationLog, MigrationOutcome};
 pub use naming::{prefix_tool_name, strip_server_prefix, TOOL_DELIMITER};
 pub use permissions::is_tool_public;
-pub use registry::{BackendConnector, RegistryError, ServerRegistry, ServerState, ServerStatus};
+pub use registry::{
+    BackendConnector, RegistryError, ServerRegistry, ServerStarter, ServerState, ServerStatus,
+};
 pub use remote_url::{validate_remote_url, RemoteUrlError};
 pub use servers::{ServerConfig, ServerStore, ServerType};
 pub use settings::{read_settings, AppSettings, SettingsStore, SharedSettings};

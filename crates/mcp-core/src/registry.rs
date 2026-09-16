@@ -56,6 +56,14 @@ pub trait BackendConnector: Send + Sync {
     ) -> Result<Arc<dyn McpBackend>, RegistryError>;
 }
 
+/// Starts a named server on demand. Implemented by the desktop session,
+/// which owns keychain secret loading; the HTTP layer depends on this port
+/// instead of spawning upstream servers itself.
+#[async_trait]
+pub trait ServerStarter: Send + Sync {
+    async fn ensure_started(&self, server_name: &str) -> Result<(), String>;
+}
+
 pub struct ServerRegistry {
     store: ServerStore,
     connector: Arc<dyn BackendConnector>,

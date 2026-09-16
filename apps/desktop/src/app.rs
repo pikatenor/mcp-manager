@@ -479,7 +479,9 @@ impl App {
         let aggregator = session.aggregator();
         let call_log = session.call_log();
         let http: Task<Message> = Task::future(async move {
-            if let Err(error) = mcp_http::serve_with_aggregator(tokens, aggregator, call_log).await
+            if let Err(error) =
+                mcp_http::serve_with_endpoint(tokens, mcp_http::Endpoint::new(aggregator, call_log))
+                    .await
             {
                 eprintln!("mcp http server failed: {error}");
             }
