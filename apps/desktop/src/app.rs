@@ -4,8 +4,8 @@ use std::sync::Arc;
 use iced::widget::{column, container, row, scrollable, space, text, text_editor};
 use iced::{clipboard, window, Alignment, Element, Font, Length, Size, Subscription, Task};
 use mcp_core::{
-    run_pending, IssuedToken, Migration, MigrationLog, MigrationOutcome, ServerState, ServerStatus,
-    ServerType, TokenRecord, ToolCallEntry,
+    run_pending, AppSettings, IssuedToken, Migration, MigrationLog, MigrationOutcome, ServerState,
+    ServerStatus, ServerType, TokenRecord, ToolCallEntry,
 };
 use mcp_platform::{AppPaths, NativeAppPaths, NativeBrowserOpener, SecretStore};
 use mcp_runtime::McpConnector;
@@ -58,6 +58,7 @@ pub(crate) enum Section {
     Servers,
     Tokens,
     Logs,
+    Settings,
 }
 
 /// Rows the pane loads; the store retains more behind the call-log cap.
@@ -305,6 +306,7 @@ pub(crate) struct App {
     window_id: Option<window::Id>,
     pub(crate) endpoint: String,
     pub(crate) section: Section,
+    pub(crate) settings: AppSettings,
     pub(crate) show_add_form: bool,
     pub(crate) editing_id: Option<String>,
     pub(crate) show_import_form: bool,
@@ -364,6 +366,9 @@ pub enum Message {
     RefreshLogs,
     LogsLoaded(Result<Vec<ToolCallEntry>, String>),
     ClearLogs,
+    ToggleListStoppedFromCache(bool),
+    ToggleOnDemandStart(bool),
+    SettingsSaved(Result<(), String>),
     ServerName(String),
     ServerType(FormServerType),
     Command(String),
@@ -499,6 +504,7 @@ impl App {
             session: session.clone(),
             window_id: None,
             section: Section::Servers,
+            settings: session.settings_snapshot(),
             show_add_form: false,
             editing_id: None,
             show_import_form: false,
@@ -574,6 +580,17 @@ impl App {
         Task::perform(
             async move { session.list_tool_calls(LOG_ROWS) },
             Message::LogsLoaded,
+        )
+    }
+
+    /// Persist the optimistically-updated flags; the endpoint reads them
+    /// through the session's shared handle on save.
+    fn save_settings(&self) -> Task<Message> {
+        let session = self.session.clone();
+        let settings = self.settings;
+        Task::perform(
+            async move { session.update_settings(settings) },
+            Message::SettingsSaved,
         )
     }
 
@@ -701,6 +718,11 @@ impl App {
                 if section == Section::Logs {
                     self.load_logs()
                 } else {
+                    if section == Section::Settings {
+                        // Another surface (or a failed toggle's revert) may
+                        // have changed the session flags; resync on entry.
+                        self.settings = self.session.settings_snapshot();
+                    }
                     Task::none()
                 }
             }
@@ -892,6 +914,26 @@ impl App {
                     },
                 )
             }
+            Message::ToggleListStoppedFromCache(value) => {
+                // Optimistic flip; a failed persist reverts from the session.
+                self.settings.list_stopped_from_cache = value;
+                self.save_settings()
+            }
+            Message::ToggleOnDemandStart(value) => {
+                self.settings.on_demand_start = value;
+                self.save_settings()
+            }
+            Message::SettingsSaved(result) => match result {
+                Ok(()) => {
+                    self.error = None;
+                    Task::none()
+                }
+                Err(error) => {
+                    self.settings = self.session.settings_snapshot();
+                    self.error = Some(error);
+                    Task::none()
+                }
+            },
             Message::ServerName(value) => {
                 self.server_name = value;
                 Task::none()
@@ -1143,6 +1185,11 @@ impl App {
                     "Tool calls",
                     Message::Navigate(Section::Logs),
                 ),
+                ui::nav_item(
+                    self.section == Section::Settings,
+                    "Settings",
+                    Message::Navigate(Section::Settings),
+                ),
             ]
             .spacing(2),
         );
@@ -1158,6 +1205,7 @@ impl App {
             Section::Servers => ui::servers::view(self),
             Section::Tokens => ui::tokens::view(self),
             Section::Logs => ui::logs::view(self),
+            Section::Settings => ui::settings::view(self),
         };
 
         let mut body = column![].spacing(16);
