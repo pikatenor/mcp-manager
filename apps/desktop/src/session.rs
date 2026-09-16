@@ -3,10 +3,12 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use async_trait::async_trait;
 use mcp_core::{
-    is_tool_public, Aggregator, BackendConnector, CallLog, ImportedServer, IssuedToken,
-    RegistryError, ServerConfig, ServerRegistry, ServerState, ServerStatus, ServerType,
-    TokenRecord, TokenService, ToolCacheStore, ToolCallEntry,
+    is_tool_public, read_settings, Aggregator, AppSettings, BackendConnector, CallLog,
+    ImportedServer, IssuedToken, RegistryError, ServerConfig, ServerRegistry, ServerStarter,
+    ServerState, ServerStatus, ServerType, SettingsStore, SharedSettings, TokenRecord,
+    TokenService, ToolCacheStore, ToolCallEntry,
 };
 use mcp_platform::{
     server_bearer_key, server_env_key, server_oauth_client_id_key, server_oauth_client_secret_key,
@@ -23,6 +25,13 @@ pub struct Session {
     call_log: Arc<CallLog>,
     secrets: Arc<dyn SecretStore>,
     browser: Arc<dyn BrowserOpener>,
+    /// Feature flags shared with the inbound endpoint; snapshotted per read.
+    settings: SharedSettings,
+    settings_db: Arc<SettingsStore>,
+    /// Per-server start gates so UI, auto-start, and on-demand starts of the
+    /// same server coalesce into one connect. Lock order: gate → registry →
+    /// aggregator.
+    start_gates: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +272,12 @@ impl Session {
         let aggregator = registry.aggregator();
         let call_log =
             CallLog::open_sqlite(&data_dir.join("calls.db")).map_err(|e| e.to_string())?;
+        let settings_db = Arc::new(
+            SettingsStore::open_sqlite(&data_dir.join("settings.db")).map_err(|e| e.to_string())?,
+        );
+        let settings: SharedSettings = Arc::new(std::sync::RwLock::new(
+            settings_db.load().map_err(|e| e.to_string())?,
+        ));
         Ok(Self {
             tokens: Arc::new(Mutex::new(tokens)),
             registry: Arc::new(AsyncMutex::new(registry)),
@@ -270,6 +285,9 @@ impl Session {
             call_log: Arc::new(call_log),
             secrets,
             browser,
+            settings,
+            settings_db,
+            start_gates: Arc::new(AsyncMutex::new(HashMap::new())),
         })
     }
 
@@ -620,7 +638,36 @@ impl Session {
         registry.delete(id).await.map_err(|e| e.to_string())
     }
 
+    /// The per-server start gate shared by UI, auto-start, and on-demand
+    /// starts. Lock order: gate → registry → aggregator.
+    async fn start_gate(&self, id: &str) -> Arc<AsyncMutex<()>> {
+        self.start_gates
+            .lock()
+            .await
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+
+    async fn server_status(&self, id: &str) -> Option<ServerStatus> {
+        self.registry
+            .lock()
+            .await
+            .list()
+            .ok()?
+            .into_iter()
+            .find(|state| state.config.id == id)
+            .map(|state| state.status)
+    }
+
     pub async fn start_server(&self, id: &str) -> Result<(), String> {
+        let gate = self.start_gate(id).await;
+        let _guard = gate.lock().await;
+        // A previous gate holder may have finished this start while we
+        // waited; re-check so coalesced callers connect at most once.
+        if self.server_status(id).await == Some(ServerStatus::Running) {
+            return Ok(());
+        }
         let (config, server_secrets, connector) = {
             let mut registry = self.registry.lock().await;
             let config = registry.begin_start(id).map_err(|e| e.to_string())?;
@@ -748,5 +795,62 @@ impl Session {
             }
         }
         Ok(())
+    }
+
+    // ---- Settings and boot seeding ----
+
+    pub fn settings_snapshot(&self) -> AppSettings {
+        read_settings(&self.settings)
+    }
+
+    /// The shared flags handle for the inbound endpoint.
+    pub fn shared_settings(&self) -> SharedSettings {
+        self.settings.clone()
+    }
+
+    /// Persist then publish; a failed persist keeps the previous in-memory
+    /// value so the endpoint never runs ahead of disk.
+    pub fn update_settings(&self, settings: AppSettings) -> Result<(), String> {
+        self.settings_db
+            .save(&settings)
+            .map_err(|e| e.to_string())?;
+        let mut guard = self
+            .settings
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = settings;
+        Ok(())
+    }
+
+    /// Seed stopped aggregator entries from the persisted tool cache so the
+    /// endpoint can serve cached tools and route on-demand starts. Runs at
+    /// every launch, before auto-start.
+    pub async fn restore_stopped_servers(&self) -> Result<(), String> {
+        self.registry
+            .lock()
+            .await
+            .restore_stopped_servers()
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[async_trait]
+impl ServerStarter for Session {
+    async fn ensure_started(&self, server_name: &str) -> Result<(), String> {
+        let (id, disabled) = {
+            let registry = self.registry.lock().await;
+            let state = registry
+                .list()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|state| state.config.name == server_name)
+                .ok_or_else(|| format!("unknown server: {server_name}"))?;
+            (state.config.id, state.config.disabled)
+        };
+        if disabled {
+            return Err(format!("server \"{server_name}\" is disabled"));
+        }
+        self.start_server(&id).await
     }
 }

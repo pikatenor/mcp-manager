@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 iced = { version = "0.14", features = ["tokio"] }
+async-trait.workspace = true
 chrono.workspace = true
 mcp-core.workspace = true
 mcp-http.workspace = true
@@ -24,6 +25,5 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 tray-icon = "0.24"
 
 [dev-dependencies]
-async-trait.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

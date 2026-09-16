@@ -478,10 +478,16 @@ impl App {
         let tokens = session.tokens();
         let aggregator = session.aggregator();
         let call_log = session.call_log();
+        let settings = session.shared_settings();
+        let starter_session = session.clone();
         let http: Task<Message> = Task::future(async move {
-            if let Err(error) =
-                mcp_http::serve_with_endpoint(tokens, mcp_http::Endpoint::new(aggregator, call_log))
-                    .await
+            if let Err(error) = mcp_http::serve_with_endpoint(
+                tokens,
+                mcp_http::Endpoint::new(aggregator, call_log)
+                    .with_settings(settings)
+                    .with_starter(Arc::new(starter_session)),
+            )
+            .await
             {
                 eprintln!("mcp http server failed: {error}");
             }
@@ -541,6 +547,11 @@ impl App {
                             MigrationOutcome::Skipped(_) => {}
                         }
                     }
+                }
+                // Seeding precedes auto-start so cached stopped entries exist
+                // before any upsert; it is every-launch, not a migration.
+                if let Err(error) = session.restore_stopped_servers().await {
+                    eprintln!("restore stopped servers failed: {error}");
                 }
                 if let Err(error) = session.begin_auto_start().await {
                     eprintln!("begin auto-start failed: {error}");
