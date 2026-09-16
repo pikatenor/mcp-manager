@@ -1,6 +1,6 @@
 use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Extension, Json, State};
@@ -11,7 +11,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use futures::stream;
-use mcp_core::{strip_server_prefix, Aggregator, AggregatorError, CallLog, TokenService};
+use mcp_core::{
+    read_settings, strip_server_prefix, Aggregator, AggregatorError, AppSettings, CallLog,
+    ServerStarter, SharedSettings, TokenService,
+};
 use serde_json::{json, Value};
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -21,31 +24,65 @@ use crate::auth::extract_bearer;
 #[derive(Clone)]
 pub struct ClientName(pub String);
 
+/// Everything the inbound endpoint needs beyond auth tokens. Settings are
+/// snapshotted per request; `starter` is the optional on-demand start port
+/// (None ⇒ a stopped server's tools behave as unknown tools).
+#[derive(Clone)]
+pub struct Endpoint {
+    pub aggregator: Arc<AsyncMutex<Aggregator>>,
+    pub call_log: Arc<CallLog>,
+    pub settings: SharedSettings,
+    pub starter: Option<Arc<dyn ServerStarter>>,
+    pub start_timeout: Duration,
+}
+
+impl Endpoint {
+    pub fn new(aggregator: Arc<AsyncMutex<Aggregator>>, call_log: Arc<CallLog>) -> Self {
+        Self {
+            aggregator,
+            call_log,
+            settings: Arc::new(RwLock::new(AppSettings::default())),
+            starter: None,
+            // `McpConnector::connect` has no internal deadline; without this
+            // a hung stdio spawn would hang the calling client forever.
+            start_timeout: Duration::from_secs(30),
+        }
+    }
+
+    pub fn with_settings(mut self, settings: SharedSettings) -> Self {
+        self.settings = settings;
+        self
+    }
+
+    pub fn with_starter(mut self, starter: Arc<dyn ServerStarter>) -> Self {
+        self.starter = Some(starter);
+        self
+    }
+
+    pub fn with_start_timeout(mut self, timeout: Duration) -> Self {
+        self.start_timeout = timeout;
+        self
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub tokens: Arc<Mutex<TokenService>>,
-    pub aggregator: Arc<AsyncMutex<Aggregator>>,
-    pub call_log: Arc<CallLog>,
+    pub endpoint: Endpoint,
 }
 
 pub fn router(tokens: Arc<Mutex<TokenService>>) -> Router {
-    router_with_aggregator(
+    router_with_endpoint(
         tokens,
-        Arc::new(AsyncMutex::new(Aggregator::new())),
-        Arc::new(CallLog::memory().expect("in-memory call log")),
+        Endpoint::new(
+            Arc::new(AsyncMutex::new(Aggregator::new())),
+            Arc::new(CallLog::memory().expect("in-memory call log")),
+        ),
     )
 }
 
-pub fn router_with_aggregator(
-    tokens: Arc<Mutex<TokenService>>,
-    aggregator: Arc<AsyncMutex<Aggregator>>,
-    call_log: Arc<CallLog>,
-) -> Router {
-    let state = AppState {
-        tokens,
-        aggregator,
-        call_log,
-    };
+pub fn router_with_endpoint(tokens: Arc<Mutex<TokenService>>, endpoint: Endpoint) -> Router {
+    let state = AppState { tokens, endpoint };
     Router::new()
         .route("/mcp", get(mcp_listen).post(mcp_handler))
         .route_layer(from_fn_with_state(state.clone(), require_token))
@@ -53,47 +90,45 @@ pub fn router_with_aggregator(
 }
 
 pub async fn serve(tokens: Arc<Mutex<TokenService>>) -> std::io::Result<()> {
-    serve_with_aggregator(
+    serve_with_endpoint(
         tokens,
-        Arc::new(AsyncMutex::new(Aggregator::new())),
-        Arc::new(CallLog::memory().expect("in-memory call log")),
+        Endpoint::new(
+            Arc::new(AsyncMutex::new(Aggregator::new())),
+            Arc::new(CallLog::memory().expect("in-memory call log")),
+        ),
     )
     .await
 }
 
-pub async fn serve_with_aggregator(
+pub async fn serve_with_endpoint(
     tokens: Arc<Mutex<TokenService>>,
-    aggregator: Arc<AsyncMutex<Aggregator>>,
-    call_log: Arc<CallLog>,
+    endpoint: Endpoint,
 ) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(mcp_core::DEFAULT_HTTP_BIND).await?;
-    serve_with_listener_and_aggregator(listener, tokens, aggregator, call_log).await
+    serve_with_listener_and_endpoint(listener, tokens, endpoint).await
 }
 
 pub async fn serve_with_listener(
     listener: tokio::net::TcpListener,
     tokens: Arc<Mutex<TokenService>>,
 ) -> std::io::Result<()> {
-    serve_with_listener_and_aggregator(
+    serve_with_listener_and_endpoint(
         listener,
         tokens,
-        Arc::new(AsyncMutex::new(Aggregator::new())),
-        Arc::new(CallLog::memory().expect("in-memory call log")),
+        Endpoint::new(
+            Arc::new(AsyncMutex::new(Aggregator::new())),
+            Arc::new(CallLog::memory().expect("in-memory call log")),
+        ),
     )
     .await
 }
 
-pub async fn serve_with_listener_and_aggregator(
+pub async fn serve_with_listener_and_endpoint(
     listener: tokio::net::TcpListener,
     tokens: Arc<Mutex<TokenService>>,
-    aggregator: Arc<AsyncMutex<Aggregator>>,
-    call_log: Arc<CallLog>,
+    endpoint: Endpoint,
 ) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        router_with_aggregator(tokens, aggregator, call_log),
-    )
-    .await
+    axum::serve(listener, router_with_endpoint(tokens, endpoint)).await
 }
 
 async fn require_token(
@@ -157,12 +192,19 @@ fn error_kind_of(err: &AggregatorError) -> &'static str {
     match err {
         AggregatorError::UnknownTool(_) => "unknown_tool",
         AggregatorError::PrivateTool(_) => "private_tool",
+        // Flag-off parity: a stopped server's tool is reported unknown.
+        AggregatorError::ServerNotRunning(_) => "unknown_tool",
         AggregatorError::Backend(_) => "backend_error",
     }
 }
 
 async fn mcp_listen(State(state): State<AppState>) -> Response {
-    let changes = state.aggregator.lock().await.subscribe_tool_list_changes();
+    let changes = state
+        .endpoint
+        .aggregator
+        .lock()
+        .await
+        .subscribe_tool_list_changes();
     let events = stream::unfold(changes, |mut changes| async move {
         loop {
             match changes.recv().await {
@@ -207,8 +249,15 @@ async fn mcp_handler(
         "notifications/initialized" => StatusCode::ACCEPTED.into_response(),
         "ping" => jsonrpc_ok(id, json!({})),
         "tools/list" => {
-            // Snapshot routing data under a short lock;
-            let servers = state.aggregator.lock().await.listed_servers();
+            // Snapshot routing data under a short lock; the settings flag
+            // decides whether stopped servers join via their cached lists.
+            let include_stopped = read_settings(&state.endpoint.settings).list_stopped_from_cache;
+            let servers = state
+                .endpoint
+                .aggregator
+                .lock()
+                .await
+                .listed_servers(include_stopped);
             match Aggregator::resolve_listed_tools(servers).await {
                 Ok(tools) => {
                     let tools: Vec<Value> = tools
@@ -233,44 +282,99 @@ async fn mcp_handler(
                 .cloned()
                 .unwrap_or_else(|| json!({}));
             let started = Instant::now();
-            let outcome = {
-                let resolved = state.aggregator.lock().await.resolve_tool(name);
+            let settings = read_settings(&state.endpoint.settings);
+            let mut outcome = {
+                let resolved = state.endpoint.aggregator.lock().await.resolve_tool(name);
                 match resolved {
-                    Ok(resolved) => Aggregator::call_resolved(resolved, arguments).await,
+                    Ok(resolved) => Aggregator::call_resolved(resolved, arguments.clone()).await,
                     Err(err) => Err(err),
                 }
             };
+            // On-demand start: for a known-but-stopped server, start it and
+            // retry the call once. Flag-off requests never take this path.
+            let mut start_error: Option<(String, String)> = None;
+            if settings.on_demand_start {
+                if let Err(AggregatorError::ServerNotRunning(server)) = &outcome {
+                    if let Some(starter) = state.endpoint.starter.clone() {
+                        let server = server.clone();
+                        match tokio::time::timeout(
+                            state.endpoint.start_timeout,
+                            starter.ensure_started(&server),
+                        )
+                        .await
+                        {
+                            Ok(Ok(())) => {
+                                let resolved =
+                                    state.endpoint.aggregator.lock().await.resolve_tool(name);
+                                outcome = match resolved {
+                                    Ok(resolved) => {
+                                        Aggregator::call_resolved(resolved, arguments).await
+                                    }
+                                    Err(err) => Err(err),
+                                };
+                            }
+                            Ok(Err(detail)) => start_error = Some((server, detail)),
+                            Err(_) => {
+                                start_error = Some((
+                                    server,
+                                    format!("timed out after {:?}", state.endpoint.start_timeout),
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
             let duration_ms = started.elapsed().as_millis() as i64;
             let (server, tool) = strip_server_prefix(name).unwrap_or(("", name));
-            let ok = outcome.is_ok();
-            let error_kind = outcome.as_ref().err().map(error_kind_of);
-            let response = match outcome {
-                Ok(value) => {
-                    // Upstream CallToolResult objects forward verbatim so
-                    // content blocks and structuredContent survive; plain
-                    // JSON values keep the text-wrapped shape.
-                    let mut result = if value.get("content").and_then(Value::as_array).is_some() {
-                        value
-                    } else {
-                        json!({ "content": [{ "type": "text", "text": value.to_string() }] })
-                    };
-                    if result.get("isError").is_none() {
-                        result["isError"] = json!(false);
-                    }
-                    jsonrpc_ok(id, result)
-                }
-                Err(AggregatorError::UnknownTool(name) | AggregatorError::PrivateTool(name)) => {
-                    jsonrpc_err(id, -32601, name)
-                }
-                Err(err) => jsonrpc_ok(
+            let ok = start_error.is_none() && outcome.is_ok();
+            let error_kind = if start_error.is_some() {
+                // Raw start details stay out of the log; category only.
+                Some("start_failed")
+            } else {
+                outcome.as_ref().err().map(error_kind_of)
+            };
+            let response = if let Some((server, detail)) = start_error {
+                jsonrpc_err(
                     id,
-                    json!({
-                        "content": [{ "type": "text", "text": err.to_string() }],
-                        "isError": true
-                    }),
-                ),
+                    -32603,
+                    format!("failed to start server \"{server}\": {detail}"),
+                )
+            } else {
+                match outcome {
+                    Ok(value) => {
+                        // Upstream CallToolResult objects forward verbatim so
+                        // content blocks and structuredContent survive; plain
+                        // JSON values keep the text-wrapped shape.
+                        let mut result = if value.get("content").and_then(Value::as_array).is_some()
+                        {
+                            value
+                        } else {
+                            json!({ "content": [{ "type": "text", "text": value.to_string() }] })
+                        };
+                        if result.get("isError").is_none() {
+                            result["isError"] = json!(false);
+                        }
+                        jsonrpc_ok(id, result)
+                    }
+                    Err(
+                        AggregatorError::UnknownTool(name) | AggregatorError::PrivateTool(name),
+                    ) => jsonrpc_err(id, -32601, name),
+                    // Without an on-demand start a stopped server's tool is
+                    // indistinguishable from an unknown tool on the wire.
+                    Err(AggregatorError::ServerNotRunning(_)) => {
+                        jsonrpc_err(id, -32601, name.to_string())
+                    }
+                    Err(err) => jsonrpc_ok(
+                        id,
+                        json!({
+                            "content": [{ "type": "text", "text": err.to_string() }],
+                            "isError": true
+                        }),
+                    ),
+                }
             };
             state
+                .endpoint
                 .call_log
                 .record(server, tool, &client.0, ok, error_kind, duration_ms);
             response
@@ -420,7 +524,7 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend: Arc::new(FakeBackend {
+            backend: Some(Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
                     title: Some("Docs Search".into()),
@@ -439,14 +543,13 @@ mod tests {
                     icons: Some(json!([{ "src": "https://example.com/search.png" }])),
                     meta: Some(json!({ "fixture": "docs" })),
                 }],
-            }),
+            })),
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
         (
-            router_with_aggregator(
+            router_with_endpoint(
                 Arc::new(Mutex::new(tokens)),
-                Arc::new(AsyncMutex::new(aggregator)),
-                call_log.clone(),
+                Endpoint::new(Arc::new(AsyncMutex::new(aggregator)), call_log.clone()),
             ),
             plaintext,
             call_log,
@@ -464,7 +567,7 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend: Arc::new(FakeBackend {
+            backend: Some(Arc::new(FakeBackend {
                 tools: vec![Tool {
                     name: "search".into(),
                     title: None,
@@ -479,13 +582,12 @@ mod tests {
                     icons: None,
                     meta: None,
                 }],
-            }),
+            })),
         });
         let aggregator = Arc::new(AsyncMutex::new(aggregator));
-        let app = router_with_aggregator(
+        let app = router_with_endpoint(
             Arc::new(Mutex::new(tokens)),
-            aggregator.clone(),
-            Arc::new(CallLog::memory().unwrap()),
+            Endpoint::new(aggregator.clone(), Arc::new(CallLog::memory().unwrap())),
         );
         (app, plaintext, aggregator)
     }
@@ -518,14 +620,13 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend,
+            backend: Some(backend),
         });
         let call_log = Arc::new(CallLog::memory().unwrap());
         (
-            router_with_aggregator(
+            router_with_endpoint(
                 Arc::new(Mutex::new(tokens)),
-                Arc::new(AsyncMutex::new(aggregator)),
-                call_log.clone(),
+                Endpoint::new(Arc::new(AsyncMutex::new(aggregator)), call_log.clone()),
             ),
             plaintext,
             call_log,
@@ -830,6 +931,300 @@ mod tests {
         assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
     }
 
+    // ---- Settings-gated listing and on-demand start ----
+
+    fn shared_settings(settings: AppSettings) -> SharedSettings {
+        Arc::new(RwLock::new(settings))
+    }
+
+    /// A stopped docs entry exactly as boot seeding would create it.
+    fn stopped_docs_aggregator(tool_permissions: HashMap<String, bool>) -> Aggregator {
+        let mut aggregator = Aggregator::new();
+        aggregator.add_server(RegisteredServer {
+            id: "1".into(),
+            name: "docs".into(),
+            running: false,
+            tool_permissions,
+            cached_tools: Some(vec![bare_tool("search")]),
+            backend: None,
+        });
+        aggregator
+    }
+
+    fn seeded_list_app(settings: AppSettings) -> (Router, String) {
+        let mut tokens = TokenService::new();
+        let issued = tokens.issue("cursor");
+        let plaintext = issued.plaintext.clone();
+        let app = router_with_endpoint(
+            Arc::new(Mutex::new(tokens)),
+            Endpoint::new(
+                Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::new()))),
+                Arc::new(CallLog::memory().unwrap()),
+            )
+            .with_settings(shared_settings(settings)),
+        );
+        (app, plaintext)
+    }
+
+    #[tokio::test]
+    async fn tools_list_serves_stopped_server_cache_when_enabled() {
+        let (app, token) = seeded_list_app(AppSettings {
+            list_stopped_from_cache: true,
+            ..Default::default()
+        });
+        let (_, json) = list_tools(app, &token).await;
+        let names: Vec<&str> = json["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["docs__search"]);
+    }
+
+    #[tokio::test]
+    async fn tools_list_hides_stopped_server_cache_when_flag_off() {
+        let (app, token) = seeded_list_app(AppSettings::default());
+        let (_, json) = list_tools(app, &token).await;
+        assert!(
+            json["result"]["tools"].as_array().unwrap().is_empty(),
+            "{json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_call_stopped_server_maps_to_unknown_tool_without_starter() {
+        let (app, token) = seeded_list_app(AppSettings {
+            on_demand_start: true,
+            ..Default::default()
+        });
+        let (_, json) = post_mcp(app, &token, call_body(7, "docs__search", json!({}))).await;
+        assert_eq!(json["error"]["code"], -32601);
+    }
+
+    /// ServerStarter that flips the stopped entry to running with a live
+    /// backend, mimicking the desktop session's finish_start, and records
+    /// which server names it was asked to start.
+    struct FlippingStarter {
+        aggregator: Arc<AsyncMutex<Aggregator>>,
+        calls: Mutex<Vec<String>>,
+        tools: Vec<Tool>,
+    }
+
+    #[async_trait]
+    impl ServerStarter for FlippingStarter {
+        async fn ensure_started(&self, server_name: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(server_name.to_string());
+            self.aggregator
+                .lock()
+                .await
+                .upsert_server(RegisteredServer {
+                    id: "1".into(),
+                    name: server_name.to_string(),
+                    running: true,
+                    tool_permissions: Default::default(),
+                    cached_tools: None,
+                    backend: Some(Arc::new(FakeBackend {
+                        tools: self.tools.clone(),
+                    })),
+                });
+            Ok(())
+        }
+    }
+
+    struct FailingStarter(&'static str);
+
+    #[async_trait]
+    impl ServerStarter for FailingStarter {
+        async fn ensure_started(&self, _server_name: &str) -> Result<(), String> {
+            Err(self.0.to_string())
+        }
+    }
+
+    /// Never resolves: exercises the handler's own start timeout.
+    struct PendingStarter;
+
+    #[async_trait]
+    impl ServerStarter for PendingStarter {
+        async fn ensure_started(&self, _server_name: &str) -> Result<(), String> {
+            futures::future::pending().await
+        }
+    }
+
+    fn app_with_on_demand(
+        aggregator: Arc<AsyncMutex<Aggregator>>,
+        settings: AppSettings,
+        starter: Arc<dyn ServerStarter>,
+        start_timeout: std::time::Duration,
+    ) -> (Router, String, Arc<CallLog>) {
+        let mut tokens = TokenService::new();
+        let issued = tokens.issue("cursor");
+        let plaintext = issued.plaintext.clone();
+        let call_log = Arc::new(CallLog::memory().unwrap());
+        let app = router_with_endpoint(
+            Arc::new(Mutex::new(tokens)),
+            Endpoint::new(aggregator, call_log.clone())
+                .with_settings(shared_settings(settings))
+                .with_starter(starter)
+                .with_start_timeout(start_timeout),
+        );
+        (app, plaintext, call_log)
+    }
+
+    #[tokio::test]
+    async fn tools_call_starts_stopped_server_on_demand() {
+        let aggregator = Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::new())));
+        let starter = Arc::new(FlippingStarter {
+            aggregator: aggregator.clone(),
+            calls: Mutex::new(Vec::new()),
+            tools: vec![bare_tool("search")],
+        });
+        let (app, token, call_log) = app_with_on_demand(
+            aggregator,
+            AppSettings {
+                on_demand_start: true,
+                ..Default::default()
+            },
+            starter.clone(),
+            std::time::Duration::from_secs(5),
+        );
+
+        let (status, json) = post_mcp(app, &token, call_body(7, "docs__search", json!({}))).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["result"]["isError"], false);
+        assert_eq!(*starter.calls.lock().unwrap(), vec!["docs".to_string()]);
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server, "docs");
+        assert!(rows[0].ok);
+        assert_eq!(rows[0].error_kind, None);
+    }
+
+    #[tokio::test]
+    async fn tools_call_does_not_start_when_flag_off() {
+        let aggregator = Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::new())));
+        let starter = Arc::new(FlippingStarter {
+            aggregator: aggregator.clone(),
+            calls: Mutex::new(Vec::new()),
+            tools: vec![bare_tool("search")],
+        });
+        let (app, token, call_log) = app_with_on_demand(
+            aggregator,
+            AppSettings::default(),
+            starter.clone(),
+            std::time::Duration::from_secs(5),
+        );
+
+        let (_, json) = post_mcp(app, &token, call_body(7, "docs__search", json!({}))).await;
+        assert_eq!(json["error"]["code"], -32601);
+        assert!(starter.calls.lock().unwrap().is_empty());
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_start_failure_returns_error_and_logs_start_failed() {
+        let aggregator = Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::new())));
+        let (app, token, call_log) = app_with_on_demand(
+            aggregator,
+            AppSettings {
+                on_demand_start: true,
+                ..Default::default()
+            },
+            Arc::new(FailingStarter("spawn failed")),
+            std::time::Duration::from_secs(5),
+        );
+
+        let (_, json) = post_mcp(app, &token, call_body(7, "docs__search", json!({}))).await;
+        assert_eq!(json["error"]["code"], -32603);
+        let message = json["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("failed to start server \"docs\"") && message.contains("spawn failed"),
+            "{message}"
+        );
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].server, "docs");
+        assert!(!rows[0].ok);
+        assert_eq!(rows[0].error_kind.as_deref(), Some("start_failed"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_start_timeout_fails() {
+        let aggregator = Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::new())));
+        let (app, token, call_log) = app_with_on_demand(
+            aggregator,
+            AppSettings {
+                on_demand_start: true,
+                ..Default::default()
+            },
+            Arc::new(PendingStarter),
+            std::time::Duration::from_millis(50),
+        );
+
+        let (_, json) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            post_mcp(app, &token, call_body(7, "docs__search", json!({}))),
+        )
+        .await
+        .expect("start timeout bounds the request");
+        assert_eq!(json["error"]["code"], -32603);
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows[0].error_kind.as_deref(), Some("start_failed"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_after_start_maps_unknown_tool() {
+        // The starter succeeds but the now-live server lacks the tool.
+        let aggregator = Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::new())));
+        let (app, token, call_log) = app_with_on_demand(
+            aggregator.clone(),
+            AppSettings {
+                on_demand_start: true,
+                ..Default::default()
+            },
+            Arc::new(FlippingStarter {
+                aggregator,
+                calls: Mutex::new(Vec::new()),
+                tools: vec![],
+            }),
+            std::time::Duration::from_secs(5),
+        );
+
+        let (_, json) = post_mcp(app, &token, call_body(7, "docs__missing", json!({}))).await;
+        assert_eq!(json["error"]["code"], -32601);
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows[0].error_kind.as_deref(), Some("unknown_tool"));
+    }
+
+    #[tokio::test]
+    async fn tools_call_private_tool_on_stopped_server_never_starts() {
+        let aggregator = Arc::new(AsyncMutex::new(stopped_docs_aggregator(HashMap::from([(
+            "search".to_string(),
+            false,
+        )]))));
+        let starter = Arc::new(FlippingStarter {
+            aggregator: aggregator.clone(),
+            calls: Mutex::new(Vec::new()),
+            tools: vec![bare_tool("search")],
+        });
+        let (app, token, call_log) = app_with_on_demand(
+            aggregator,
+            AppSettings {
+                on_demand_start: true,
+                list_stopped_from_cache: true,
+            },
+            starter.clone(),
+            std::time::Duration::from_secs(5),
+        );
+
+        let (_, json) = post_mcp(app, &token, call_body(7, "docs__search", json!({}))).await;
+        assert_eq!(json["error"]["code"], -32601);
+        assert!(starter.calls.lock().unwrap().is_empty());
+        let rows = call_log.list_recent(10).unwrap();
+        assert_eq!(rows[0].error_kind.as_deref(), Some("private_tool"));
+    }
+
     /// Upstream backend whose list blocks until released, with a signal for
     /// when the handler has reached it.
     struct GatedBackend {
@@ -879,16 +1274,15 @@ mod tests {
             running: true,
             tool_permissions: Default::default(),
             cached_tools: None,
-            backend: Arc::new(GatedBackend {
+            backend: Some(Arc::new(GatedBackend {
                 entered: entered_tx,
                 release: AsyncMutex::new(Some(release_rx)),
-            }),
+            })),
         });
         let aggregator = Arc::new(AsyncMutex::new(aggregator));
-        let app = router_with_aggregator(
+        let app = router_with_endpoint(
             Arc::new(Mutex::new(tokens)),
-            aggregator.clone(),
-            Arc::new(CallLog::memory().unwrap()),
+            Endpoint::new(aggregator.clone(), Arc::new(CallLog::memory().unwrap())),
         );
         (app, plaintext, aggregator, entered_rx, release_tx)
     }

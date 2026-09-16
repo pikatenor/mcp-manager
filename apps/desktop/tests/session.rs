@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use mcp_core::{
-    AggregatorError, BackendConnector, McpBackend, RegistryError, ServerConfig, ServerStatus,
-    ServerType, Tool,
+    Aggregator, AggregatorError, BackendConnector, McpBackend, RegistryError, ServerConfig,
+    ServerStatus, ServerType, Tool,
 };
 use mcp_manager::session::{parse_env, AddServerRequest, ImportOutcome, Session};
 use mcp_platform::{
@@ -1334,4 +1334,314 @@ async fn migrate_legacy_secrets_keeps_legacy_when_the_bundle_write_fails() {
         .is_err());
     // The legacy item survives so the next launch can retry the move.
     assert_eq!(legacy.get(&key).unwrap().as_deref(), Some("tok"));
+}
+
+// ---- Settings, on-demand start, and boot seeding ----
+
+#[test]
+fn session_open_creates_settings_and_tool_cache_dbs() {
+    let fx = session(vec![]);
+    assert!(fx._dir.path().join("settings.db").exists());
+    assert!(fx._dir.path().join("tool-cache.db").exists());
+}
+
+#[test]
+fn settings_default_to_off_and_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let session = Session::open(
+            dir.path(),
+            Arc::new(RecordingConnector { tools: vec![] }),
+            Arc::new(MemorySecretStore::new()),
+            Arc::new(NoopBrowser),
+        )
+        .unwrap();
+        assert_eq!(
+            session.settings_snapshot(),
+            mcp_core::AppSettings::default()
+        );
+        session
+            .update_settings(mcp_core::AppSettings {
+                list_stopped_from_cache: true,
+                on_demand_start: true,
+            })
+            .unwrap();
+        assert!(session.settings_snapshot().list_stopped_from_cache);
+    }
+    let session = Session::open(
+        dir.path(),
+        Arc::new(RecordingConnector { tools: vec![] }),
+        Arc::new(MemorySecretStore::new()),
+        Arc::new(NoopBrowser),
+    )
+    .unwrap();
+    assert!(session.settings_snapshot().on_demand_start);
+}
+
+#[tokio::test]
+async fn start_server_is_idempotent_when_already_running() {
+    let (fx, spy) = spy_session();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    fx.session.start_server(&config.id).await.unwrap();
+    fx.session.start_server(&config.id).await.unwrap();
+    assert_eq!(spy.seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        fx.session.list_servers().await.unwrap()[0].status,
+        ServerStatus::Running
+    );
+}
+
+/// Gated connect that also records which server ids reached it, so several
+/// concurrent starts can be observed through one held gate.
+struct CountingGatedConnector {
+    seen: std::sync::Mutex<Vec<String>>,
+    entered: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    release: std::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+#[async_trait]
+impl BackendConnector for CountingGatedConnector {
+    async fn connect(
+        &self,
+        config: &ServerConfig,
+        _secrets: &HashMap<String, String>,
+    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+        self.seen.lock().unwrap().push(config.id.clone());
+        if let Some(tx) = self.entered.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+        let rx = self.release.lock().unwrap().take();
+        if let Some(rx) = rx {
+            let _ = rx.await;
+        }
+        Ok(Arc::new(StaticBackend { tools: vec![] }))
+    }
+}
+
+#[tokio::test]
+async fn concurrent_starts_coalesce_into_one_connect() {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let connector = Arc::new(CountingGatedConnector {
+        seen: std::sync::Mutex::new(Vec::new()),
+        entered: std::sync::Mutex::new(Some(entered_tx)),
+        release: std::sync::Mutex::new(Some(release_rx)),
+    });
+    let fx = open_session(connector.clone());
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+
+    let session = fx.session.clone();
+    let id = config.id.clone();
+    let first = tokio::spawn({
+        let session = session.clone();
+        let id = id.clone();
+        async move { session.start_server(&id).await }
+    });
+    let second = tokio::spawn({
+        let session = session.clone();
+        let id = id.clone();
+        async move { session.start_server(&id).await }
+    });
+    entered_rx.await.unwrap();
+    let third = tokio::spawn(async move { session.start_server(&id).await });
+    let _ = release_tx.send(());
+    first.await.unwrap().unwrap();
+    second.await.unwrap().unwrap();
+    third.await.unwrap().unwrap();
+
+    assert_eq!(connector.seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        fx.session.list_servers().await.unwrap()[0].status,
+        ServerStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn ensure_started_starts_by_name() {
+    let (fx, spy) = spy_session();
+    let mut request = local_add("everything");
+    request.auto_start = false;
+    fx.session.add_server(request).await.unwrap();
+
+    mcp_core::ServerStarter::ensure_started(&fx.session, "everything")
+        .await
+        .unwrap();
+    assert_eq!(spy.seen.lock().unwrap().len(), 1);
+    assert_eq!(
+        fx.session.list_servers().await.unwrap()[0].status,
+        ServerStatus::Running
+    );
+}
+
+#[tokio::test]
+async fn ensure_started_refuses_disabled_server() {
+    let dir = tempfile::tempdir().unwrap();
+    // The UI cannot create a disabled server; seed one through the registry
+    // on the same state.db the session will open.
+    {
+        let mut registry = mcp_core::ServerRegistry::open_sqlite(
+            &dir.path().join("state.db"),
+            Arc::new(RecordingConnector { tools: vec![] }),
+            Arc::new(
+                mcp_core::ToolCacheStore::open_sqlite(&dir.path().join("tool-cache.db")).unwrap(),
+            ),
+        )
+        .unwrap();
+        registry
+            .add(ServerConfig {
+                id: "srv-disabled".into(),
+                name: "disabled-one".into(),
+                server_type: ServerType::Local,
+                command: Some("npx".into()),
+                args: vec![],
+                env_keys: vec![],
+                remote_url: None,
+                auto_start: false,
+                disabled: true,
+                tool_permissions: HashMap::new(),
+            })
+            .unwrap();
+    }
+    let spy = Arc::new(SpyConnector::default());
+    let session = Session::open(
+        dir.path(),
+        spy.clone(),
+        Arc::new(MemorySecretStore::new()),
+        Arc::new(NoopBrowser),
+    )
+    .unwrap();
+
+    let err = mcp_core::ServerStarter::ensure_started(&session, "disabled-one")
+        .await
+        .unwrap_err();
+    assert!(err.contains("disabled"), "{err}");
+    assert!(spy.seen.lock().unwrap().is_empty());
+    assert_eq!(
+        session.list_servers().await.unwrap()[0].status,
+        ServerStatus::Stopped
+    );
+}
+
+#[tokio::test]
+async fn ensure_started_errors_on_unknown_name() {
+    let (fx, spy) = spy_session();
+    let err = mcp_core::ServerStarter::ensure_started(&fx.session, "ghost")
+        .await
+        .unwrap_err();
+    assert!(err.contains("ghost"), "{err}");
+    assert!(spy.seen.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn ensure_started_is_ok_when_already_running() {
+    let (fx, spy) = spy_session();
+    let config = fx
+        .session
+        .add_server(local_add("everything"))
+        .await
+        .unwrap();
+    fx.session.start_server(&config.id).await.unwrap();
+
+    mcp_core::ServerStarter::ensure_started(&fx.session, "everything")
+        .await
+        .unwrap();
+    assert_eq!(spy.seen.lock().unwrap().len(), 1);
+}
+
+/// Backend with a live list_changed watcher, so starts actually populate
+/// the persisted tool cache (pull-only backends are never cached).
+struct WatchableBackend {
+    tools: Vec<Tool>,
+    changes: tokio::sync::watch::Sender<u64>,
+}
+
+impl WatchableBackend {
+    fn connector(tools: Vec<Tool>) -> Arc<WatchableConnector> {
+        let (changes, _) = tokio::sync::watch::channel(0);
+        Arc::new(WatchableConnector(Arc::new(Self { tools, changes })))
+    }
+}
+
+#[async_trait]
+impl McpBackend for WatchableBackend {
+    async fn list_tools(&self) -> Result<Vec<Tool>, AggregatorError> {
+        Ok(self.tools.clone())
+    }
+
+    async fn call_tool(
+        &self,
+        _name: &str,
+        _arguments: serde_json::Value,
+    ) -> Result<serde_json::Value, AggregatorError> {
+        Ok(serde_json::json!({ "ok": true }))
+    }
+
+    fn tool_list_watcher(&self) -> Option<tokio::sync::watch::Receiver<u64>> {
+        Some(self.changes.subscribe())
+    }
+}
+
+struct WatchableConnector(Arc<WatchableBackend>);
+
+#[async_trait]
+impl BackendConnector for WatchableConnector {
+    async fn connect(
+        &self,
+        _config: &ServerConfig,
+        _secrets: &HashMap<String, String>,
+    ) -> Result<Arc<dyn McpBackend>, RegistryError> {
+        Ok(self.0.clone())
+    }
+}
+
+#[tokio::test]
+async fn stopped_server_tools_survive_app_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let connector = WatchableBackend::connector(vec![tool("echo")]);
+    {
+        let session = Session::open(
+            dir.path(),
+            connector.clone(),
+            Arc::new(MemorySecretStore::new()),
+            Arc::new(NoopBrowser),
+        )
+        .unwrap();
+        let config = session.add_server(local_add("everything")).await.unwrap();
+        let mut changes = session
+            .aggregator()
+            .lock()
+            .await
+            .subscribe_tool_list_changes();
+        session.start_server(&config.id).await.unwrap();
+        // First broadcast: the start upsert; second: the watcher's initial
+        // cache fill (and its persist), which must land before the stop.
+        changes.recv().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), changes.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        session.stop_server(&config.id).await.unwrap();
+    }
+
+    let session = Session::open(
+        dir.path(),
+        connector,
+        Arc::new(MemorySecretStore::new()),
+        Arc::new(NoopBrowser),
+    )
+    .unwrap();
+    session.restore_stopped_servers().await.unwrap();
+
+    let servers = session.aggregator().lock().await.listed_servers(true);
+    let tools = Aggregator::resolve_listed_tools(servers).await.unwrap();
+    let names: Vec<_> = tools.into_iter().map(|tool| tool.name).collect();
+    assert_eq!(names, vec!["everything__echo".to_string()]);
 }

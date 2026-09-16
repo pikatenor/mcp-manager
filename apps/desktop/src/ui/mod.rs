@@ -2,6 +2,7 @@
 
 pub(crate) mod logs;
 pub(crate) mod servers;
+pub(crate) mod settings;
 pub(crate) mod styles;
 pub(crate) mod theme;
 pub(crate) mod tokens;
