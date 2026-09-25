@@ -2,6 +2,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 
 use super::token::{TokenError, TokenRecord, TokenService};
 
@@ -11,6 +12,19 @@ pub enum StoreError {
     Database(String),
     #[error(transparent)]
     Token(#[from] TokenError),
+}
+
+pub(crate) fn db_err(err: impl ToString) -> StoreError {
+    StoreError::Database(err.to_string())
+}
+
+/// Shared SQLite helpers: structured values are stored as JSON text.
+pub(crate) fn json_to_sql<T: Serialize + ?Sized>(value: &T) -> Result<String, StoreError> {
+    serde_json::to_string(value).map_err(db_err)
+}
+
+pub(crate) fn json_from_sql<T: for<'de> Deserialize<'de>>(raw: String) -> Result<T, StoreError> {
+    serde_json::from_str(&raw).map_err(db_err)
 }
 
 impl TokenService {

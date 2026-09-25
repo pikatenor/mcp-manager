@@ -8,6 +8,6 @@ mod server;
 pub use auth::extract_bearer;
 pub use mcp_core::{DEFAULT_HTTP_BIND, DEFAULT_MCP_PATH};
 pub use server::{
-    router, router_with_aggregator, serve, serve_with_aggregator, serve_with_listener,
-    serve_with_listener_and_aggregator,
+    router, router_with_endpoint, serve, serve_with_endpoint, serve_with_listener,
+    serve_with_listener_and_endpoint, Endpoint,
 };
