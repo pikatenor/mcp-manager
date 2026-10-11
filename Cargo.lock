@@ -2663,7 +2663,7 @@ checksum = "47e1ffaa40ddd1f3ed91f717a33c8c0ee23fff369e3aa8772b9605cc1d22f4c3"
 
 [[package]]
 name = "mcp-core"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "hex",
@@ -2680,7 +2680,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-http"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-manager"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "chrono",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-platform"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "dirs",
  "keyring",
@@ -2726,7 +2726,7 @@ dependencies = [
 
 [[package]]
 name = "mcp-runtime"
-version = "1.0.0"
+version = "1.0.1"
 dependencies = [
  "async-trait",
  "axum",
