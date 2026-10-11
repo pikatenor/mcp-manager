@@ -11,7 +11,7 @@ use mcp_core::{
     Tool,
 };
 use mcp_platform::SecretStore;
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientInfo, Implementation};
+use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::auth::{AuthError, AuthorizationManager, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -53,8 +53,8 @@ struct AggregatorClient {
 }
 
 impl ClientHandler for AggregatorClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::new(
+    fn get_info(&self) -> ClientConfig {
+        ClientConfig::new(
             ClientCapabilities::default(),
             Implementation::new("mcp-manager", env!("CARGO_PKG_VERSION")),
         )
