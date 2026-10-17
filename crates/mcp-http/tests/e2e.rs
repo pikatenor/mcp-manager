@@ -3,7 +3,7 @@
 use std::sync::{Arc, Mutex};
 
 use mcp_core::{Aggregator, CallLog, TokenService};
-use mcp_http::{serve_with_listener, serve_with_listener_and_aggregator};
+use mcp_http::{serve_with_listener, serve_with_listener_and_endpoint, Endpoint};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex as AsyncMutex;
@@ -122,7 +122,7 @@ async fn e2e_call_log_records_tools_call_over_tcp() {
     let tokens = Arc::new(Mutex::new(tokens));
     let aggregator = Arc::new(AsyncMutex::new(Aggregator::new()));
     tokio::spawn(async move {
-        serve_with_listener_and_aggregator(listener, tokens, aggregator, call_log)
+        serve_with_listener_and_endpoint(listener, tokens, Endpoint::new(aggregator, call_log))
             .await
             .unwrap();
     });

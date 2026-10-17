@@ -4,7 +4,7 @@ use std::path::Path;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use super::store::StoreError;
+use super::store::{db_err, json_from_sql, json_to_sql, StoreError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -32,10 +32,6 @@ pub struct ServerStore {
     conn: Connection,
 }
 
-fn db_err(err: impl ToString) -> StoreError {
-    StoreError::Database(err.to_string())
-}
-
 fn type_to_sql(server_type: ServerType) -> &'static str {
     match server_type {
         ServerType::Local => "local",
@@ -53,14 +49,6 @@ fn type_from_sql(value: &str) -> Result<ServerType, StoreError> {
             "unknown server type: {other}"
         ))),
     }
-}
-
-fn json_to_sql<T: Serialize>(value: &T) -> Result<String, StoreError> {
-    serde_json::to_string(value).map_err(db_err)
-}
-
-fn json_from_sql<T: for<'de> Deserialize<'de>>(raw: String) -> Result<T, StoreError> {
-    serde_json::from_str(&raw).map_err(db_err)
 }
 
 fn row_to_config(row: &rusqlite::Row<'_>) -> Result<ServerConfig, StoreError> {
