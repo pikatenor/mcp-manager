@@ -171,6 +171,71 @@ async fn streamable_http_lists_and_calls_with_bearer() {
     assert!(text.contains("echo"), "{text}");
 }
 
+/// GitHub's remote MCP server (api.githubcopilot.com/mcp/) binds the session's
+/// behavior to the protocol version the client *requested* in `initialize`:
+/// a session opened with `2026-07-28` (the revision that removed the
+/// initialize handshake) answers `notifications/initialized` with
+/// `400 invalid session`, even though the InitializeResult negotiates back to
+/// an older version. rmcp 3.5.1 advertises `LATEST` (`2026-07-28`) by default,
+/// so the connector must pin a version that still has the handshake.
+#[tokio::test]
+async fn streamable_http_pins_a_protocol_version_that_still_uses_initialized() {
+    let addr = spawn_version_gated_streamable().await;
+    let config = remote_config(ServerType::RemoteStreamable, format!("http://{addr}/mcp"));
+    let backend = McpConnector::default()
+        .connect(&config, &HashMap::new())
+        .await
+        .expect("handshake completes against a GitHub-like server");
+    let tools = backend.list_tools().await.unwrap();
+    assert_eq!(tools[0].name, "echo");
+}
+
+/// Streamable server modeled on api.githubcopilot.com: it accepts any
+/// `initialize` but, when the client requested `2026-07-28`, the resulting
+/// session rejects `notifications/initialized` with a plain-text 400 the way
+/// GitHub's does.
+async fn spawn_version_gated_streamable() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let requested = Arc::new(parking_lot::Mutex::new(None::<String>));
+    let gated = requested.clone();
+    let app = Router::new().route(
+        "/mcp",
+        post(move |request: Request<Body>| async move {
+            let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(json!({}));
+            let method = body.get("method").and_then(|m| m.as_str()).unwrap_or("");
+            match method {
+                "initialize" => {
+                    *gated.lock() = body
+                        .pointer("/params/protocolVersion")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                    handle_mcp(body)
+                }
+                "notifications/initialized" => {
+                    let modern = gated
+                        .lock()
+                        .as_deref()
+                        .is_some_and(|version| version == "2026-07-28");
+                    if modern {
+                        (StatusCode::BAD_REQUEST, "invalid session").into_response()
+                    } else {
+                        StatusCode::ACCEPTED.into_response()
+                    }
+                }
+                _ => handle_mcp(body),
+            }
+        }),
+    );
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    addr
+}
+
 fn sse_json(value: Value) -> Response {
     Response::builder()
         .status(StatusCode::OK)
