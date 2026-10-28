@@ -48,4 +48,4 @@ rmcp = { version = "3", default-features = false, features = [
 ] }
 oauth2 = "5"
 futures = "0.3"
-sse-stream = "0.2"
+sse-stream = "0.3"
