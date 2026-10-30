@@ -2736,6 +2736,7 @@ dependencies = [
  "mcp-core",
  "mcp-platform",
  "oauth2",
+ "parking_lot",
  "reqwest 0.13.5",
  "rmcp",
  "serde",

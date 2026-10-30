@@ -11,7 +11,9 @@ use mcp_core::{
     Tool,
 };
 use mcp_platform::SecretStore;
-use rmcp::model::{CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, ClientConfig, Implementation, ProtocolVersion,
+};
 use rmcp::service::{RoleClient, RunningService};
 use rmcp::transport::auth::{AuthError, AuthorizationManager, OAuthClientConfig};
 use rmcp::transport::child_process::TokioChildProcess;
@@ -58,6 +60,11 @@ impl ClientHandler for AggregatorClient {
             ClientCapabilities::default(),
             Implementation::new("mcp-manager", env!("CARGO_PKG_VERSION")),
         )
+        // Why not the default (LATEST = 2026-07-28): that revision removed the
+        // initialize handshake, and servers such as GitHub's invalidate the
+        // session against the notifications/initialized this connector still
+        // sends over serve_client's legacy lifecycle.
+        .with_protocol_version(ProtocolVersion::LATEST_WITH_INITIALIZE)
     }
 
     fn on_tool_list_changed(
